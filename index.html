@@ -37,6 +37,14 @@
 
 <script src="https://alcdn.msauth.net/browser/2.38.3/js/msal-browser.min.js"></script>
 <script>
+  // Fallback 1: jsDelivr CDN
+  window.msal || document.write('<script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@2.38.3/lib/msal-browser.min.js"><\/script>');
+</script>
+<script>
+  // Fallback 2: a local copy placed next to index.html (see instructions)
+  window.msal || document.write('<script src="msal-browser.min.js"><\/script>');
+</script>
+<script>
 /* ============ CONFIGURE THESE ============ */
 const CONFIG = {
   clientId:    "9cfe8c4d-e0fb-4372-a7c1-6300aac80fbd",  // Entra ID app registration > Application (client) ID
