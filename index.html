@@ -49,6 +49,15 @@ const CONFIG = {
 const BC_SCOPE = ["https://api.businesscentral.dynamics.com/Financials.ReadWrite.All"];
 const BC_BASE  = `https://api.businesscentral.dynamics.com/v2.0/${CONFIG.tenantId}/${CONFIG.environment}/api/v2.0`;
 
+window.addEventListener("error", e => {
+  document.getElementById("status").textContent = "Script error: " + e.message;
+});
+if (typeof msal === "undefined") {
+  document.getElementById("status").textContent =
+    "The Microsoft sign-in library did not load (blocked network, ad blocker, or no internet).";
+  throw new Error("msal library missing");
+}
+
 const msalApp = new msal.PublicClientApplication({
   auth: {
     clientId: CONFIG.clientId,
@@ -73,15 +82,13 @@ function showSignedIn() {
 
 async function login() {
   try {
-    const res = await msalApp.loginPopup({ scopes: BC_SCOPE });
-    account = res.account;
-    msalApp.setActiveAccount(account);
-    showSignedIn();
+    setStatus("Redirecting to Microsoft sign-in...");
+    await msalApp.loginRedirect({ scopes: BC_SCOPE });
   } catch (e) { setStatus("Login failed: " + e.message); }
 }
 
 function logout() {
-  msalApp.logoutPopup({ account }).then(() => location.reload());
+  msalApp.logoutRedirect({ account });
 }
 
 async function getToken() {
@@ -164,9 +171,17 @@ $("frm").addEventListener("submit", createCustomer);
 
 // Restore an existing session after page refresh
 (async () => {
-  await msalApp.initialize?.();
-  const accounts = msalApp.getAllAccounts();
-  if (accounts.length) { account = accounts[0]; msalApp.setActiveAccount(account); showSignedIn(); }
+  try {
+    await msalApp.initialize?.();
+    const result = await msalApp.handleRedirectPromise();
+    if (result && result.account) {
+      account = result.account;
+    } else {
+      const accounts = msalApp.getAllAccounts();
+      if (accounts.length) account = accounts[0];
+    }
+    if (account) { msalApp.setActiveAccount(account); showSignedIn(); }
+  } catch (e) { setStatus("Sign-in error: " + e.message); }
 })();
 </script>
 </body>
