@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Business Central Portal</title>
+<style>
+  :root { --bg:#f4f6f8; --card:#fff; --line:#d8dde4; --accent:#0b5cad; --text:#1f2430; --muted:#6b7280; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--text); }
+  header { background:var(--accent); color:#fff; padding:.7rem 1rem; display:flex; gap:.75rem; align-items:center; flex-wrap:wrap; }
+  header h1 { font-size:1.1rem; margin:0; flex:1; }
+  header select, header button { padding:.4rem .7rem; }
+  #status { margin:.75rem 1rem; padding:.6rem .8rem; background:#e9edf2; border-radius:6px; }
+  #status.err { background:#fdecea; color:#8a1c12; }
+  #status.ok  { background:#e6f4ea; color:#14532d; }
+  main { padding:0 1rem 2rem; max-width:1100px; margin:0 auto; }
+  nav { display:flex; gap:.25rem; flex-wrap:wrap; border-bottom:2px solid var(--line); margin-bottom:1rem; }
+  nav button { background:none; border:none; padding:.6rem 1rem; cursor:pointer; font-size:.95rem; border-bottom:3px solid transparent; margin-bottom:-2px; }
+  nav button.active { border-bottom-color:var(--accent); color:var(--accent); font-weight:600; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:1rem; margin-bottom:1rem; }
+  .card h2 { margin:0 0 .75rem; font-size:1rem; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:.75rem; align-items:end; }
+  label { display:block; font-size:.8rem; color:var(--muted); }
+  input, select { width:100%; padding:.5rem; margin-top:.2rem; border:1px solid var(--line); border-radius:4px; font-size:.9rem; }
+  button { padding:.5rem 1rem; cursor:pointer; border-radius:4px; border:1px solid var(--accent); background:var(--accent); color:#fff; }
+  button.ghost { background:#fff; color:var(--accent); }
+  button:disabled { opacity:.6; cursor:wait; }
+  .line { display:grid; grid-template-columns:2fr 1fr 1.3fr auto; gap:.5rem; margin-bottom:.5rem; align-items:end; }
+  .tablewrap { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; font-size:.85rem; }
+  th, td { border-bottom:1px solid var(--line); padding:.4rem .6rem; text-align:left; white-space:nowrap; }
+  th { background:#f0f3f6; }
+  .muted { color:var(--muted); }
+  .row-actions { display:flex; gap:.5rem; margin-top:.75rem; flex-wrap:wrap; }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Business Central Portal</h1>
+  <select id="company" class="hidden" title="Company"></select>
+  <button id="btnLogin">Sign in with Microsoft</button>
+  <button id="btnLogout" class="hidden">Sign out</button>
+</header>
+
+<div id="status">Not signed in.</div>
+
+<main id="app" class="hidden">
+  <nav id="tabs"></nav>
+  <div id="panels"></div>
+</main>
+
+<datalist id="dl-vendors"></datalist>
+<datalist id="dl-customers"></datalist>
+<datalist id="dl-items"></datalist>
+
+<script src="https://alcdn.msauth.net/browser/2.38.3/js/msal-browser.min.js"></script>
+<script>
+  window.msal || document.write('<script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@2.38.3/lib/msal-browser.min.js"><\/script>');
+</script>
+<script>
+  window.msal || document.write('<script src="msal-browser.min.js"><\/script>');
+</script>
+<script>
+/* ============ CONFIGURE THESE ============ */
+const CONFIG = {
+  clientId:    "9cfe8c4d-e0fb-4372-a7c1-6300aac80fbd",
+  tenantId:    "ab7c8c1e-dc1d-431f-ba8b-e4de2b047f8b",
+  environment: "Production",   // <- your BC environment name
+  redirectUri: window.location.origin + window.location.pathname
+};
+/* ======================================== */
+
+const statusBox = document.getElementById("status");
+function setStatus(msg, kind) { statusBox.textContent = msg; statusBox.className = kind || ""; }
+
+window.addEventListener("error", e => setStatus("Script error: " + e.message, "err"));
+if (typeof msal === "undefined") {
+  setStatus("The Microsoft sign-in library did not load (blocked network, ad blocker, or no internet).", "err");
+  throw new Error("msal library missing");
+}
+
+const BC_SCOPE = ["https://api.businesscentral.dynamics.com/Financials.ReadWrite.All"];
+const BC_BASE  = `https://api.businesscentral.dynamics.com/v2.0/${CONFIG.tenantId}/${CONFIG.environment}/api/v2.0`;
+
+const msalApp = new msal.PublicClientApplication({
+  auth: {
+    clientId: CONFIG.clientId,
+    authority: `https://login.microsoftonline.com/${CONFIG.tenantId}`,
+    redirectUri: CONFIG.redirectUri
+  },
+  cache: { cacheLocation: "sessionStorage" }
+});
+
+let account = null;
+let companyId = null;
+
+/* ---------- auth ---------- */
+async function login() {
+  try {
+    setStatus("Redirecting to Microsoft sign-in...");
+    await msalApp.loginRedirect({ scopes: BC_SCOPE });
+  } catch (e) { setStatus("Login failed: " + e.message, "err"); }
+}
+function logout() { msalApp.logoutRedirect({ account }); }
+
+async function getToken() {
+  try {
+    const r = await msalApp.acquireTokenSilent({ scopes: BC_SCOPE, account });
+    return r.accessToken;
+  } catch (e) {
+    await msalApp.acquireTokenRedirect({ scopes: BC_SCOPE });
+    throw new Error("Re-authenticating...");
+  }
+}
+
+/* ---------- BC calls ---------- */
+function niceError(text) {
+  try { return JSON.parse(text).error.message; } catch { return text; }
+}
+async function bc(path, options = {}) {
+  const token = await getToken();
+  const res = await fetch(BC_BASE + path, {
+    ...options,
+    headers: {
+      "Authorization": "Bearer " + token,
+      "Accept": "application/json",
+      "Content-Type": "application/json",
+      ...(options.headers || {})
+    }
+  });
+  if (!res.ok) throw new Error(`BC ${res.status}: ${niceError(await res.text())}`);
+  return res.status === 204 ? null : res.json();
+}
+const co = (path, options) => bc(`/companies(${companyId})${path}`, options);
+
+/* ---------- tiny DOM helper ---------- */
+function h(tag, attrs = {}, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") el.className = v;
+    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else if (v !== undefined && v !== false) el.setAttribute(k, v === true ? "" : v);
+  }
+  kids.flat().forEach(c => el.append(c instanceof Node ? c : document.createTextNode(c ?? "")));
+  return el;
+}
+
+function renderTable(box, cols, rows) {
+  box.replaceChildren();
+  if (!rows.length) { box.append(h("p", { class: "muted" }, "No records.")); return; }
+  box.append(h("table", {},
+    h("thead", {}, h("tr", {}, cols.map(c => h("th", {}, c[1])))),
+    h("tbody", {}, rows.map(r => h("tr", {}, cols.map(c => h("td", {}, r[c[0]] ?? "")))))
+  ));
+}
+
+/* ---------- definitions ---------- */
+const MASTER = {
+  items: {
+    title: "Part Numbers (Items)", singular: "item", endpoint: "items",
+    fields: [
+      { key: "number", label: "Part no. (blank = auto)" },
+      { key: "displayName", label: "Description", required: true },
+      { key: "type", label: "Type", options: ["Inventory", "Service", "Non-Inventory"] },
+      { key: "baseUnitOfMeasureCode", label: "Unit of measure (e.g. PCS)" },
+      { key: "unitPrice", label: "Unit price", type: "number" },
+      { key: "unitCost", label: "Unit cost", type: "number" }
+    ],
+    columns: [["number","Part no."],["displayName","Description"],["type","Type"],["baseUnitOfMeasureCode","UoM"],["unitPrice","Unit price"],["inventory","Inventory"]]
+  },
+  vendors: {
+    title: "Suppliers (Vendors)", singular: "supplier", endpoint: "vendors",
+    fields: [
+      { key: "number", label: "Supplier ID (blank = auto)" },
+      { key: "displayName", label: "Name", required: true },
+      { key: "email", label: "Email", type: "email" },
+      { key: "phoneNumber", label: "Phone" },
+      { key: "addressLine1", label: "Address" },
+      { key: "city", label: "City" },
+      { key: "postalCode", label: "Postal code" },
+      { key: "country", label: "Country code (e.g. MY)" }
+    ],
+    columns: [["number","Supplier ID"],["displayName","Name"],["email","Email"],["phoneNumber","Phone"],["city","City"]]
+  },
+  customers: {
+    title: "Customers", singular: "customer", endpoint: "customers",
+    fields: [
+      { key: "number", label: "Customer ID (blank = auto)" },
+      { key: "displayName", label: "Name", required: true },
+      { key: "email", label: "Email", type: "email" },
+      { key: "phoneNumber", label: "Phone" },
+      { key: "addressLine1", label: "Address" },
+      { key: "city", label: "City" },
+      { key: "postalCode", label: "Postal code" },
+      { key: "country", label: "Country code (e.g. MY)" }
+    ],
+    columns: [["number","Customer ID"],["displayName","Name"],["email","Email"],["phoneNumber","Phone"],["city","City"]]
+  }
+};
+
+const ORDERS = {
+  po: {
+    title: "Purchase Orders", endpoint: "purchaseOrders", linesEndpoint: "purchaseOrderLines",
+    partyKey: "vendorNumber", partyLabel: "Supplier ID", partyList: "dl-vendors",
+    priceKey: "directUnitCost", priceLabel: "Unit cost",
+    extKey: null,
+    columns: [["number","PO no."],["vendorNumber","Supplier"],["vendorName","Name"],["orderDate","Date"],["status","Status"],["totalAmountIncludingTax","Total"]]
+  },
+  so: {
+    title: "Sales Orders", endpoint: "salesOrders", linesEndpoint: "salesOrderLines",
+    partyKey: "customerNumber", partyLabel: "Customer ID", partyList: "dl-customers",
+    priceKey: "unitPrice", priceLabel: "Unit price",
+    extKey: "externalDocumentNumber", extLabel: "Customer PO no. (optional)",
+    columns: [["number","SO no."],["customerNumber","Customer"],["customerName","Name"],["orderDate","Date"],["status","Status"],["totalAmountIncludingTax","Total"]]
+  }
+};
+
+const TABS = [
+  { id: "items",     label: "Part Number", build: () => buildMaster("items") },
+  { id: "vendors",   label: "Supplier",    build: () => buildMaster("vendors") },
+  { id: "customers", label: "Customer",    build: () => buildMaster("customers") },
+  { id: "po",        label: "Purchase Order", build: () => buildOrder("po") },
+  { id: "so",        label: "Sales Order",    build: () => buildOrder("so") }
+];
+const refreshers = {};   // tab id -> function that reloads its list
+
+/* ---------- lookups for dropdown suggestions ---------- */
+async function loadLookups() {
+  const sets = [["vendors","dl-vendors"],["customers","dl-customers"],["items","dl-items"]];
+  for (const [ep, dl] of sets) {
+    try {
+      const data = await co(`/${ep}?$top=500`);
+      document.getElementById(dl).replaceChildren(...data.value.map(r =>
+        h("option", { value: r.number, label: r.displayName || "" })));
+    } catch (e) { /* suggestions are optional */ }
+  }
+}
+
+/* ---------- master data tab ---------- */
+function buildMaster(key) {
+  const def = MASTER[key];
+  const msg = h("p", { class: "muted" });
+  const listBox = h("div", { class: "tablewrap" });
+
+  const fieldEls = def.fields.map(f => {
+    const input = f.options
+      ? h("select", { name: f.key }, h("option", { value: "" }, "(default)"), f.options.map(o => h("option", { value: o }, o)))
+      : h("input", { name: f.key, type: f.type || "text", required: !!f.required, step: f.type === "number" ? "any" : undefined });
+    return h("label", {}, f.label, input);
+  });
+  const btn = h("button", { type: "submit" }, "Create " + def.singular);
+  const form = h("form", { class: "grid" }, fieldEls, btn);
+
+  form.addEventListener("submit", async ev => {
+    ev.preventDefault();
+    const body = {};
+    def.fields.forEach(f => {
+      let v = form.elements[f.key].value.trim();
+      if (v === "") return;
+      body[f.key] = f.type === "number" ? Number(v) : v;
+    });
+    btn.disabled = true; setStatus("Creating " + def.singular + "...");
+    try {
+      const rec = await co(`/${def.endpoint}`, { method: "POST", body: JSON.stringify(body) });
+      setStatus(`Created ${def.singular} ${rec.number} - ${rec.displayName}`, "ok");
+      form.reset();
+      refresh(); loadLookups();
+    } catch (e) { setStatus("Error: " + e.message, "err"); }
+    finally { btn.disabled = false; }
+  });
+
+  async function refresh() {
+    try {
+      listBox.replaceChildren(h("p", { class: "muted" }, "Loading..."));
+      const data = await co(`/${def.endpoint}?$top=50&$orderby=lastModifiedDateTime desc`);
+      renderTable(listBox, def.columns, data.value);
+    } catch (e) { listBox.replaceChildren(h("p", { class: "muted" }, "Could not load list: " + e.message)); }
+  }
+  refreshers[key] = refresh;
+
+  return h("div", {},
+    h("div", { class: "card" }, h("h2", {}, "Create " + def.singular), form, msg),
+    h("div", { class: "card" }, h("h2", {}, "Latest " + def.title),
+      h("div", { class: "row-actions" }, h("button", { type: "button", class: "ghost", onclick: refresh }, "Refresh")),
+      listBox)
+  );
+}
+
+/* ---------- order tab (PO / SO) ---------- */
+function buildOrder(key) {
+  const def = ORDERS[key];
+  const listBox = h("div", { class: "tablewrap" });
+  const linesBox = h("div", {});
+
+  function addLine() {
+    const row = h("div", { class: "line" },
+      h("label", {}, "Part no.", h("input", { name: "item", list: "dl-items", required: true, placeholder: "Part no." })),
+      h("label", {}, "Quantity", h("input", { name: "qty", type: "number", min: "0", step: "any", required: true, value: "1" })),
+      h("label", {}, def.priceLabel + " (optional)", h("input", { name: "price", type: "number", min: "0", step: "any" })),
+      h("button", { type: "button", class: "ghost", title: "Remove line", onclick: () => { if (linesBox.children.length > 1) row.remove(); } }, "✕")
+    );
+    linesBox.append(row);
+  }
+  addLine();
+
+  const today = new Date().toISOString().slice(0, 10);
+  const party = h("input", { name: "party", list: def.partyList, required: true, placeholder: def.partyLabel });
+  const date  = h("input", { name: "date", type: "date", value: today });
+  const ext   = def.extKey ? h("input", { name: "ext" }) : null;
+  const btn   = h("button", { type: "submit" }, "Create " + def.title.replace(/s$/, ""));
+
+  const form = h("form", {},
+    h("div", { class: "grid" },
+      h("label", {}, def.partyLabel, party),
+      h("label", {}, "Order date", date),
+      ext ? h("label", {}, def.extLabel, ext) : ""),
+    h("h2", { style: "margin-top:1rem" }, "Lines"),
+    linesBox,
+    h("div", { class: "row-actions" },
+      h("button", { type: "button", class: "ghost", onclick: addLine }, "+ Add line"), btn)
+  );
+
+  form.addEventListener("submit", async ev => {
+    ev.preventDefault();
+    const lines = [...linesBox.children].map(r => ({
+      item: r.querySelector("[name=item]").value.trim(),
+      qty: Number(r.querySelector("[name=qty]").value),
+      price: r.querySelector("[name=price]").value.trim()
+    }));
+    if (lines.some(l => !l.item || !(l.qty > 0))) { setStatus("Each line needs a part number and a quantity above 0.", "err"); return; }
+
+    const header = { [def.partyKey]: party.value.trim() };
+    if (date.value) header.orderDate = date.value;
+    if (ext && ext.value.trim()) header[def.extKey] = ext.value.trim();
+
+    btn.disabled = true; setStatus("Creating order...");
+    let order = null, done = 0;
+    try {
+      order = await co(`/${def.endpoint}`, { method: "POST", body: JSON.stringify(header) });
+      for (const l of lines) {
+        const line = { lineType: "Item", lineObjectNumber: l.item, quantity: l.qty };
+        if (l.price !== "") line[def.priceKey] = Number(l.price);
+        await co(`/${def.endpoint}(${order.id})/${def.linesEndpoint}`, { method: "POST", body: JSON.stringify(line) });
+        done++;
+      }
+      setStatus(`Created ${order.number} with ${done} line(s).`, "ok");
+      form.reset(); linesBox.replaceChildren(); addLine(); date.value = today;
+      refresh();
+    } catch (e) {
+      const extra = order ? ` (Order ${order.number} was created with ${done} of ${lines.length} lines; open it in Business Central to fix or delete it.)` : "";
+      setStatus("Error: " + e.message + extra, "err");
+      if (order) refresh();
+    } finally { btn.disabled = false; }
+  });
+
+  async function refresh() {
+    try {
+      listBox.replaceChildren(h("p", { class: "muted" }, "Loading..."));
+      const data = await co(`/${def.endpoint}?$top=50&$orderby=lastModifiedDateTime desc`);
+      renderTable(listBox, def.columns, data.value);
+    } catch (e) { listBox.replaceChildren(h("p", { class: "muted" }, "Could not load list: " + e.message)); }
+  }
+  refreshers[key] = refresh;
+
+  return h("div", {},
+    h("div", { class: "card" }, h("h2", {}, "Create " + def.title.replace(/s$/, "")), form),
+    h("div", { class: "card" }, h("h2", {}, "Latest " + def.title),
+      h("div", { class: "row-actions" }, h("button", { type: "button", class: "ghost", onclick: refresh }, "Refresh")),
+      listBox)
+  );
+}
+
+/* ---------- tabs ---------- */
+const loaded = {};
+function showTab(id) {
+  document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === id));
+  document.querySelectorAll("#panels > div").forEach(p => p.classList.toggle("hidden", p.dataset.tab !== id));
+  if (!loaded[id] && refreshers[id]) { loaded[id] = true; refreshers[id](); }
+}
+function buildUI() {
+  const tabs = document.getElementById("tabs"), panels = document.getElementById("panels");
+  tabs.replaceChildren(); panels.replaceChildren();
+  TABS.forEach(t => {
+    tabs.append(h("button", { "data-tab": t.id, onclick: () => showTab(t.id) }, t.label));
+    const p = t.build(); p.dataset.tab = t.id; p.classList.add("hidden"); panels.append(p);
+  });
+  showTab(TABS[0].id);
+}
+
+/* ---------- start-up after sign-in ---------- */
+async function onSignedIn() {
+  setStatus("Signed in as " + account.username + ". Loading companies...");
+  document.getElementById("btnLogin").classList.add("hidden");
+  document.getElementById("btnLogout").classList.remove("hidden");
+  try {
+    const comps = await bc("/companies");
+    if (!comps.value.length) throw new Error("No companies found for this user.");
+    const sel = document.getElementById("company");
+    sel.replaceChildren(...comps.value.map(c => h("option", { value: c.id }, c.displayName || c.name)));
+    sel.classList.remove("hidden");
+    companyId = sel.value;
+    sel.addEventListener("change", () => {
+      companyId = sel.value;
+      Object.keys(loaded).forEach(k => delete loaded[k]);
+      loadLookups();
+      const active = document.querySelector("#tabs button.active");
+      showTab(active ? active.dataset.tab : TABS[0].id);
+    });
+    document.getElementById("app").classList.remove("hidden");
+    buildUI();
+    loadLookups();
+    setStatus("Signed in as " + account.username, "ok");
+  } catch (e) { setStatus("Error: " + e.message, "err"); }
+}
+
+document.getElementById("btnLogin").addEventListener("click", login);
+document.getElementById("btnLogout").addEventListener("click", logout);
+
+(async () => {
+  try {
+    await msalApp.initialize?.();
+    const result = await msalApp.handleRedirectPromise();
+    if (result && result.account) account = result.account;
+    else { const a = msalApp.getAllAccounts(); if (a.length) account = a[0]; }
+    if (account) { msalApp.setActiveAccount(account); await onSignedIn(); }
+  } catch (e) { setStatus("Sign-in error: " + e.message, "err"); }
+})();
+</script>
+</body>
+</html>
