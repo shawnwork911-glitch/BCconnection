@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Business Central Portal</title>
 <style>
-  :root { --bg:#f4f6f8; --card:#fff; --line:#d8dde4; --accent:#0b5cad; --text:#1f2430; --muted:#6b7280; }
+  :root { --bg:#f4f6f8; --card:#fff; --line:#d8dde4; --accent:#0b5cad; --text:#1f2430; --muted:#6b7280; --danger:#b3261e; }
   * { box-sizing: border-box; }
   body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--text); }
   header { background:var(--accent); color:#fff; padding:.7rem 1rem; display:flex; gap:.75rem; align-items:center; flex-wrap:wrap; }
@@ -16,24 +16,30 @@
   #status.ok  { background:#e6f4ea; color:#14532d; }
   main { padding:0 1rem 2rem; max-width:1100px; margin:0 auto; }
   nav { display:flex; gap:.25rem; flex-wrap:wrap; border-bottom:2px solid var(--line); margin-bottom:1rem; }
-  nav button { background:none; border:none; padding:.6rem 1rem; cursor:pointer; font-size:.95rem; border-bottom:3px solid transparent; margin-bottom:-2px; }
+  nav button { background:none; border:none; padding:.6rem 1rem; cursor:pointer; font-size:.95rem; border-bottom:3px solid transparent; margin-bottom:-2px; color:var(--text); }
   nav button.active { border-bottom-color:var(--accent); color:var(--accent); font-weight:600; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:1rem; margin-bottom:1rem; }
   .card h2 { margin:0 0 .75rem; font-size:1rem; }
   .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:.75rem; align-items:end; }
   label { display:block; font-size:.8rem; color:var(--muted); }
   input, select { width:100%; padding:.5rem; margin-top:.2rem; border:1px solid var(--line); border-radius:4px; font-size:.9rem; }
+  input[type=checkbox] { width:auto; margin-right:.4rem; }
   button { padding:.5rem 1rem; cursor:pointer; border-radius:4px; border:1px solid var(--accent); background:var(--accent); color:#fff; }
   button.ghost { background:#fff; color:var(--accent); }
+  button.danger { background:#fff; color:var(--danger); border-color:var(--danger); }
+  button.small { padding:.25rem .6rem; font-size:.8rem; }
   button:disabled { opacity:.6; cursor:wait; }
   .line { display:grid; grid-template-columns:2fr 1fr 1.3fr auto; gap:.5rem; margin-bottom:.5rem; align-items:end; }
   .tablewrap { overflow-x:auto; }
   table { border-collapse:collapse; width:100%; font-size:.85rem; }
   th, td { border-bottom:1px solid var(--line); padding:.4rem .6rem; text-align:left; white-space:nowrap; }
   th { background:#f0f3f6; }
+  td.num { text-align:right; }
+  td.low { color:var(--danger); font-weight:600; }
   .muted { color:var(--muted); }
-  .row-actions { display:flex; gap:.5rem; margin-top:.75rem; flex-wrap:wrap; }
+  .row-actions { display:flex; gap:.5rem; margin-top:.75rem; flex-wrap:wrap; align-items:center; }
   .hidden { display:none !important; }
+  code { background:#f0f3f6; padding:.1rem .3rem; border-radius:3px; }
 </style>
 </head>
 <body>
@@ -69,7 +75,20 @@ const CONFIG = {
   clientId:    "9cfe8c4d-e0fb-4372-a7c1-6300aac80fbd",
   tenantId:    "ab7c8c1e-dc1d-431f-ba8b-e4de2b047f8b",
   environment: "Production",   // <- your BC environment name
-  redirectUri: window.location.origin + window.location.pathname
+  redirectUri: window.location.origin + window.location.pathname,
+
+  // Approvals are NOT in Microsoft's standard API v2.0, so they need a small
+  // custom API page (AL extension). Fill these in once it is installed.
+  // Leave publisher blank to keep the Approvals tab in "setup needed" mode.
+  approvalApi: {
+    publisher: "",              // e.g. "mycompany"
+    group:     "portal",        // APIGroup in your AL page
+    version:   "v1.0",          // APIVersion in your AL page
+    entity:    "approvalEntries", // EntitySetName in your AL page
+    approveAction: "approve",   // bound action names exposed by your AL page
+    rejectAction:  "reject"
+  },
+  lowStockThreshold: 10         // inventory at or below this is highlighted
 };
 /* ======================================== */
 
@@ -83,7 +102,8 @@ if (typeof msal === "undefined") {
 }
 
 const BC_SCOPE = ["https://api.businesscentral.dynamics.com/Financials.ReadWrite.All"];
-const BC_BASE  = `https://api.businesscentral.dynamics.com/v2.0/${CONFIG.tenantId}/${CONFIG.environment}/api/v2.0`;
+const BC_ROOT  = `https://api.businesscentral.dynamics.com/v2.0/${CONFIG.tenantId}/${CONFIG.environment}/api`;
+const BC_BASE  = `${BC_ROOT}/v2.0`;
 
 const msalApp = new msal.PublicClientApplication({
   auth: {
@@ -120,9 +140,9 @@ async function getToken() {
 function niceError(text) {
   try { return JSON.parse(text).error.message; } catch { return text; }
 }
-async function bc(path, options = {}) {
+async function bcFetch(url, options = {}) {
   const token = await getToken();
-  const res = await fetch(BC_BASE + path, {
+  const res = await fetch(url, {
     ...options,
     headers: {
       "Authorization": "Bearer " + token,
@@ -134,6 +154,7 @@ async function bc(path, options = {}) {
   if (!res.ok) throw new Error(`BC ${res.status}: ${niceError(await res.text())}`);
   return res.status === 204 ? null : res.json();
 }
+const bc = (path, options) => bcFetch(BC_BASE + path, options);
 const co = (path, options) => bc(`/companies(${companyId})${path}`, options);
 
 /* ---------- tiny DOM helper ---------- */
@@ -148,12 +169,21 @@ function h(tag, attrs = {}, ...kids) {
   return el;
 }
 
-function renderTable(box, cols, rows) {
+/* cols: [key,label]; extraCols: [{label, render(row) -> Node}] */
+function renderTable(box, cols, rows, extraCols = [], opts = {}) {
   box.replaceChildren();
   if (!rows.length) { box.append(h("p", { class: "muted" }, "No records.")); return; }
   box.append(h("table", {},
-    h("thead", {}, h("tr", {}, cols.map(c => h("th", {}, c[1])))),
-    h("tbody", {}, rows.map(r => h("tr", {}, cols.map(c => h("td", {}, r[c[0]] ?? "")))))
+    h("thead", {}, h("tr", {}, cols.map(c => h("th", {}, c[1])), extraCols.map(c => h("th", {}, c.label)))),
+    h("tbody", {}, rows.map(r => h("tr", {},
+      cols.map(c => {
+        const cls = [];
+        if (typeof r[c[0]] === "number") cls.push("num");
+        if (opts.cellClass) { const x = opts.cellClass(r, c[0]); if (x) cls.push(x); }
+        return h("td", { class: cls.join(" ") }, r[c[0]] ?? "");
+      }),
+      extraCols.map(c => h("td", {}, c.render(r)))
+    )))
   ));
 }
 
@@ -207,6 +237,8 @@ const ORDERS = {
     partyKey: "vendorNumber", partyLabel: "Supplier ID", partyList: "dl-vendors",
     priceKey: "directUnitCost", priceLabel: "Unit cost",
     extKey: null,
+    postAction: "receiveAndInvoice", postLabel: "Receive & invoice",
+    postConfirm: "Receive and invoice purchase order",
     columns: [["number","PO no."],["vendorNumber","Supplier"],["vendorName","Name"],["orderDate","Date"],["status","Status"],["totalAmountIncludingTax","Total"]]
   },
   so: {
@@ -214,6 +246,8 @@ const ORDERS = {
     partyKey: "customerNumber", partyLabel: "Customer ID", partyList: "dl-customers",
     priceKey: "unitPrice", priceLabel: "Unit price",
     extKey: "externalDocumentNumber", extLabel: "Customer PO no. (optional)",
+    postAction: "shipAndInvoice", postLabel: "Ship & invoice",
+    postConfirm: "Ship and invoice sales order",
     columns: [["number","SO no."],["customerNumber","Customer"],["customerName","Name"],["orderDate","Date"],["status","Status"],["totalAmountIncludingTax","Total"]]
   }
 };
@@ -222,8 +256,10 @@ const TABS = [
   { id: "items",     label: "Part Number", build: () => buildMaster("items") },
   { id: "vendors",   label: "Supplier",    build: () => buildMaster("vendors") },
   { id: "customers", label: "Customer",    build: () => buildMaster("customers") },
+  { id: "inventory", label: "Inventory",   build: () => buildInventory() },
   { id: "po",        label: "Purchase Order", build: () => buildOrder("po") },
-  { id: "so",        label: "Sales Order",    build: () => buildOrder("so") }
+  { id: "so",        label: "Sales Order",    build: () => buildOrder("so") },
+  { id: "approvals", label: "Approvals",   build: () => buildApprovals() }
 ];
 const refreshers = {};   // tab id -> function that reloads its list
 
@@ -286,6 +322,55 @@ function buildMaster(key) {
     h("div", { class: "card" }, h("h2", {}, "Latest " + def.title),
       h("div", { class: "row-actions" }, h("button", { type: "button", class: "ghost", onclick: refresh }, "Refresh")),
       listBox)
+  );
+}
+
+/* ---------- inventory tab ---------- */
+function buildInventory() {
+  const listBox = h("div", { class: "tablewrap" });
+  const search = h("input", { type: "search", placeholder: "Search part no. or description" });
+  const onlyInv = h("input", { type: "checkbox", checked: true });
+  const lowOnly = h("input", { type: "checkbox" });
+  const count = h("span", { class: "muted" });
+  let all = [];
+
+  const cols = [["number","Part no."],["displayName","Description"],["inventory","Inventory"],
+                ["baseUnitOfMeasureCode","UoM"],["unitCost","Unit cost"],["unitPrice","Unit price"],["type","Type"]];
+
+  function draw() {
+    const q = search.value.trim().toLowerCase();
+    const rows = all.filter(r =>
+      (!onlyInv.checked || r.type === "Inventory") &&
+      (!lowOnly.checked || (Number(r.inventory) || 0) <= CONFIG.lowStockThreshold) &&
+      (!q || (r.number || "").toLowerCase().includes(q) || (r.displayName || "").toLowerCase().includes(q)));
+    renderTable(listBox, cols, rows, [], {
+      cellClass: (r, k) => k === "inventory" && r.type === "Inventory" && (Number(r.inventory) || 0) <= CONFIG.lowStockThreshold ? "low" : ""
+    });
+    count.textContent = `${rows.length} of ${all.length} items`;
+  }
+  search.addEventListener("input", draw);
+  onlyInv.addEventListener("change", draw);
+  lowOnly.addEventListener("change", draw);
+
+  async function refresh() {
+    try {
+      listBox.replaceChildren(h("p", { class: "muted" }, "Loading..."));
+      const data = await co(`/items?$top=2000&$orderby=number`);
+      all = data.value;
+      draw();
+    } catch (e) { listBox.replaceChildren(h("p", { class: "muted" }, "Could not load inventory: " + e.message)); }
+  }
+  refreshers.inventory = refresh;
+
+  return h("div", {},
+    h("div", { class: "card" }, h("h2", {}, "Inventory on hand"),
+      h("div", { class: "grid" },
+        h("label", {}, "Search", search),
+        h("label", {}, onlyInv, "Inventory-type items only"),
+        h("label", {}, lowOnly, `Low stock only (≤ ${CONFIG.lowStockThreshold})`),
+        h("button", { type: "button", class: "ghost", onclick: refresh }, "Refresh")),
+      h("div", { class: "row-actions" }, count)),
+    h("div", { class: "card" }, listBox)
   );
 }
 
@@ -356,11 +441,39 @@ function buildOrder(key) {
     } finally { btn.disabled = false; }
   });
 
+  /* posting: PO = receive & invoice, SO = ship & invoice (irreversible, so confirm first) */
+  async function postOrder(order, button) {
+    if (!confirm(`${def.postConfirm} ${order.number}?\n\nThis posts to the ledger and cannot be undone from this portal.`)) return;
+    button.disabled = true; setStatus(`Posting ${order.number}...`);
+    try {
+      await co(`/${def.endpoint}(${order.id})/Microsoft.NAV.${def.postAction}`,
+        { method: "POST", headers: { "If-Match": "*" }, body: "{}" });
+      setStatus(`Posted ${order.number}.`, "ok");
+      refresh();
+      if (refreshers.inventory) delete loaded.inventory;
+    } catch (e) {
+      setStatus(`Could not post ${order.number}: ${e.message}`, "err");
+      button.disabled = false;
+    }
+  }
+
   async function refresh() {
     try {
       listBox.replaceChildren(h("p", { class: "muted" }, "Loading..."));
       const data = await co(`/${def.endpoint}?$top=50&$orderby=lastModifiedDateTime desc`);
-      renderTable(listBox, def.columns, data.value);
+      renderTable(listBox, def.columns, data.value, [{
+        label: "Action",
+        render: r => {
+          const b = h("button", { type: "button", class: "small" }, def.postLabel);
+          if (r.status === "In Review") {
+            b.disabled = true; b.title = "Waiting for approval";
+            b.textContent = "Awaiting approval";
+          } else {
+            b.addEventListener("click", () => postOrder(r, b));
+          }
+          return b;
+        }
+      }]);
     } catch (e) { listBox.replaceChildren(h("p", { class: "muted" }, "Could not load list: " + e.message)); }
   }
   refreshers[key] = refresh;
@@ -373,12 +486,79 @@ function buildOrder(key) {
   );
 }
 
+/* ---------- approvals tab (needs custom API page in BC) ---------- */
+function approvalBase() {
+  const a = CONFIG.approvalApi;
+  return `${BC_ROOT}/${a.publisher}/${a.group}/${a.version}/companies(${companyId})/${a.entity}`;
+}
+function buildApprovals() {
+  const a = CONFIG.approvalApi;
+  const listBox = h("div", { class: "tablewrap" });
+  const kindSel = h("select", {},
+    h("option", { value: "" }, "All documents"),
+    h("option", { value: "Purchase Order" }, "Purchase orders"),
+    h("option", { value: "Sales Order" }, "Sales orders"));
+  let rows = [];
+
+  if (!a.publisher) {
+    refreshers.approvals = () => {};
+    return h("div", {},
+      h("div", { class: "card" },
+        h("h2", {}, "Approvals need one-time setup"),
+        h("p", {}, "Microsoft's standard Business Central API v2.0 has no approval endpoints, so approving or rejecting from this portal requires a small custom API page (AL extension) installed in your environment."),
+        h("p", { class: "muted" }, "Once installed, set ", h("code", {}, "CONFIG.approvalApi.publisher"), " (and group, version, entity, action names if they differ) at the top of this file. This tab will then list pending approval requests for purchase and sales orders with Approve and Reject buttons.")));
+  }
+
+  function draw() {
+    const k = kindSel.value;
+    const shown = rows.filter(r => !k || r.documentType === k);
+    renderTable(listBox,
+      [["documentType","Document"],["documentNumber","No."],["senderId","Requested by"],["amount","Amount"],["dueDate","Due"],["status","Status"]],
+      shown,
+      [{ label: "Action", render: r => h("span", { class: "row-actions", style: "margin:0" },
+          h("button", { type: "button", class: "small", onclick: ev => act(r, a.approveAction, "approve", ev.target) }, "Approve"),
+          h("button", { type: "button", class: "small danger", onclick: ev => act(r, a.rejectAction, "reject", ev.target) }, "Reject")) }]);
+  }
+  kindSel.addEventListener("change", draw);
+
+  async function act(r, action, verb, button) {
+    if (!confirm(`${verb[0].toUpperCase() + verb.slice(1)} ${r.documentType} ${r.documentNumber}?`)) return;
+    button.disabled = true; setStatus(`Sending ${verb}...`);
+    try {
+      await bcFetch(`${approvalBase()}(${r.id})/Microsoft.NAV.${action}`,
+        { method: "POST", headers: { "If-Match": "*" }, body: "{}" });
+      setStatus(`${r.documentType} ${r.documentNumber}: ${verb} done.`, "ok");
+      refresh();
+      ["po","so"].forEach(k => refreshers[k] && refreshers[k]());
+    } catch (e) { setStatus(`Could not ${verb}: ${e.message}`, "err"); button.disabled = false; }
+  }
+
+  async function refresh() {
+    try {
+      listBox.replaceChildren(h("p", { class: "muted" }, "Loading..."));
+      const data = await bcFetch(`${approvalBase()}?$filter=status eq 'Open'&$top=200`);
+      rows = data.value;
+      draw();
+    } catch (e) { listBox.replaceChildren(h("p", { class: "muted" }, "Could not load approvals: " + e.message)); }
+  }
+  refreshers.approvals = refresh;
+
+  return h("div", {},
+    h("div", { class: "card" }, h("h2", {}, "Pending approvals"),
+      h("div", { class: "grid" },
+        h("label", {}, "Show", kindSel),
+        h("button", { type: "button", class: "ghost", onclick: refresh }, "Refresh"))),
+    h("div", { class: "card" }, listBox)
+  );
+}
+
 /* ---------- tabs ---------- */
 const loaded = {};
 function showTab(id) {
   document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === id));
   document.querySelectorAll("#panels > div").forEach(p => p.classList.toggle("hidden", p.dataset.tab !== id));
-  if (!loaded[id] && refreshers[id]) { loaded[id] = true; refreshers[id](); }
+  // inventory and approvals are always reloaded when opened so numbers are fresh
+  if ((!loaded[id] || id === "inventory" || id === "approvals") && refreshers[id]) { loaded[id] = true; refreshers[id](); }
 }
 function buildUI() {
   const tabs = document.getElementById("tabs"), panels = document.getElementById("panels");
