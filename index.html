@@ -36,6 +36,10 @@
   th { background:#f0f3f6; }
   td.num { text-align:right; }
   td.low { color:var(--danger); font-weight:600; }
+  td.wrap { white-space:normal; min-width:180px; max-width:280px; }
+  .progress { font-size:.8rem; line-height:1.35; color:var(--muted); }
+  .progress .done { color:#14532d; }
+  .pager { justify-content:flex-end; }
   .muted { color:var(--muted); }
   .row-actions { display:flex; gap:.5rem; margin-top:.75rem; flex-wrap:wrap; align-items:center; }
   .hidden { display:none !important; }
@@ -502,15 +506,36 @@ function buildOrder(key) {
     const d = lines.reduce((s, l) => s + num(l[def.doneQtyKey]), 0);
     const i = lines.reduce((s, l) => s + num(l.invoicedQuantity), 0);
     const cap = def.stepPast[0].toUpperCase() + def.stepPast.slice(1);
-    return `${cap} ${d}/${q} · Invoiced ${i}/${q}`;
+    // round away floating-point noise like 35000.00000000001
+    const f = n => Number(n.toFixed(5)).toLocaleString();
+    return h("div", { class: "progress" },
+      h("div", { class: d >= q ? "done" : "" }, `${cap} ${f(d)} / ${f(q)}`),
+      h("div", { class: i >= q ? "done" : "" }, `Invoiced ${f(i)} / ${f(q)}`));
   }
+
+  /* paging: PAGE_SIZE orders per page; fetch one extra to know if a next page exists */
+  const PAGE_SIZE = 20;
+  let page = 0;
+  const prevBtn = h("button", { type: "button", class: "ghost small", onclick: () => { if (page > 0) { page--; refresh(); } } }, "‹ Prev");
+  const nextBtn = h("button", { type: "button", class: "ghost small", onclick: () => { page++; refresh(); } }, "Next ›");
+  const pageInfo = h("span", { class: "muted" });
+  const pager = h("div", { class: "row-actions pager" }, prevBtn, pageInfo, nextBtn);
 
   async function refresh() {
     try {
       listBox.replaceChildren(h("p", { class: "muted" }, "Loading..."));
-      const data = await co(`/${def.endpoint}?$top=50&$orderby=lastModifiedDateTime desc&$expand=${def.linesEndpoint}`);
-      renderTable(listBox, def.columns, data.value, [
-        { label: "Progress", render: r => h("span", { class: "muted" }, progressText(r)) },
+      prevBtn.disabled = nextBtn.disabled = true;
+      const data = await co(`/${def.endpoint}?$top=${PAGE_SIZE + 1}&$skip=${page * PAGE_SIZE}&$orderby=lastModifiedDateTime desc&$expand=${def.linesEndpoint}`);
+      if (!data.value.length && page > 0) { page--; return refresh(); }
+      const hasNext = data.value.length > PAGE_SIZE;
+      const rows = data.value.slice(0, PAGE_SIZE);
+      const from = page * PAGE_SIZE + 1, to = page * PAGE_SIZE + rows.length;
+      pageInfo.textContent = rows.length ? `Page ${page + 1} · orders ${from}–${to}` : "";
+      prevBtn.disabled = page === 0;
+      nextBtn.disabled = !hasNext;
+      const nameKey = def.columns[2][0];
+      renderTable(listBox, def.columns, rows, [
+        { label: "Progress", render: r => progressText(r) },
         { label: "Action", render: r => {
           if (r.status === "In Review") {
             return h("button", { type: "button", class: "small", disabled: true, title: "Waiting for approval" }, "Awaiting approval");
@@ -524,9 +549,9 @@ function buildOrder(key) {
             canInv ? "Invoice" : "🔒 Invoice");
           if (canStep) stepBtn.addEventListener("click", () => postStep(r, "step", stepBtn)); else stepBtn.disabled = true;
           if (canInv)  invBtn.addEventListener("click",  () => postStep(r, "invoice", invBtn)); else invBtn.disabled = true;
-          return h("span", { class: "row-actions", style: "margin:0" }, stepBtn, invBtn);
+          return h("span", { class: "row-actions", style: "margin:0;flex-wrap:nowrap" }, stepBtn, invBtn);
         } }
-      ]);
+      ], { cellClass: (r, k) => k === nameKey ? "wrap" : "" });
     } catch (e) { listBox.replaceChildren(h("p", { class: "muted" }, "Could not load list: " + e.message)); }
   }
   refreshers[key] = refresh;
@@ -534,8 +559,8 @@ function buildOrder(key) {
   return h("div", {},
     h("div", { class: "card" }, h("h2", {}, "Create " + def.title.replace(/s$/, "")), form),
     h("div", { class: "card" }, h("h2", {}, "Latest " + def.title),
-      h("div", { class: "row-actions" }, h("button", { type: "button", class: "ghost", onclick: refresh }, "Refresh")),
-      listBox)
+      h("div", { class: "row-actions" }, h("button", { type: "button", class: "ghost", onclick: () => { page = 0; refresh(); } }, "Refresh")),
+      listBox, pager)
   );
 }
 
