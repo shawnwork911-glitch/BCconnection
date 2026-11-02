@@ -28,7 +28,7 @@
   button.ghost { background:#fff; color:var(--accent); }
   button.danger { background:#fff; color:var(--danger); border-color:var(--danger); }
   button.small { padding:.25rem .6rem; font-size:.8rem; }
-  button:disabled { opacity:.6; cursor:wait; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
   .line { display:grid; grid-template-columns:2fr 1fr 1.3fr auto; gap:.5rem; margin-bottom:.5rem; align-items:end; }
   .tablewrap { overflow-x:auto; }
   table { border-collapse:collapse; width:100%; font-size:.85rem; }
@@ -237,8 +237,10 @@ const ORDERS = {
     partyKey: "vendorNumber", partyLabel: "Supplier ID", partyList: "dl-vendors",
     priceKey: "directUnitCost", priceLabel: "Unit cost",
     extKey: null,
-    postAction: "receiveAndInvoice", postLabel: "Receive & invoice",
-    postConfirm: "Receive and invoice purchase order",
+    postAction: "receiveAndInvoice",
+    stepLabel: "Receive", stepVerb: "receive", stepPast: "received",
+    stepQtyKey: "receiveQuantity",    // line field: Qty. to Receive
+    doneQtyKey: "receivedQuantity",   // line field: Quantity Received
     columns: [["number","PO no."],["vendorNumber","Supplier"],["vendorName","Name"],["orderDate","Date"],["status","Status"],["totalAmountIncludingTax","Total"]]
   },
   so: {
@@ -246,8 +248,10 @@ const ORDERS = {
     partyKey: "customerNumber", partyLabel: "Customer ID", partyList: "dl-customers",
     priceKey: "unitPrice", priceLabel: "Unit price",
     extKey: "externalDocumentNumber", extLabel: "Customer PO no. (optional)",
-    postAction: "shipAndInvoice", postLabel: "Ship & invoice",
-    postConfirm: "Ship and invoice sales order",
+    postAction: "shipAndInvoice",
+    stepLabel: "Ship", stepVerb: "ship", stepPast: "shipped",
+    stepQtyKey: "shipQuantity",       // line field: Qty. to Ship
+    doneQtyKey: "shippedQuantity",    // line field: Quantity Shipped
     columns: [["number","SO no."],["customerNumber","Customer"],["customerName","Name"],["orderDate","Date"],["status","Status"],["totalAmountIncludingTax","Total"]]
   }
 };
@@ -441,39 +445,88 @@ function buildOrder(key) {
     } finally { btn.disabled = false; }
   });
 
-  /* posting: PO = receive & invoice, SO = ship & invoice (irreversible, so confirm first) */
-  async function postOrder(order, button) {
-    if (!confirm(`${def.postConfirm} ${order.number}?\n\nThis posts to the ledger and cannot be undone from this portal.`)) return;
-    button.disabled = true; setStatus(`Posting ${order.number}...`);
+  /* ---- posting, split into two steps ----
+     Step 1  Ship (SO) / Receive (PO): posts a shipment / receipt only (stock moves, no invoice).
+     Step 2  Invoice: posts the invoice for what has already been shipped / received.
+     The standard API only has one combined action (shipAndInvoice / receiveAndInvoice),
+     so each step first sets the line quantities, then calls that action:
+       Ship/Receive -> Qty. to Ship/Receive = outstanding, Qty. to Invoice = 0
+       Invoice      -> Qty. to Ship/Receive = 0, Qty. to Invoice = shipped/received but not invoiced
+     Business Central only posts the part that has quantities, so each button does one thing. */
+  const num = v => Number(v) || 0;
+  const qtyLines = o => (o[def.linesEndpoint] || []).filter(l => num(l.quantity) > 0);
+  const toStep    = o => qtyLines(o).filter(l => num(l.quantity) > num(l[def.doneQtyKey]));
+  const toInvoice = o => qtyLines(o).filter(l => num(l[def.doneQtyKey]) > num(l.invoicedQuantity));
+
+  async function patchLine(order, line, body) {
+    await co(`/${def.endpoint}(${order.id})/${def.linesEndpoint}(${line.id})`,
+      { method: "PATCH", headers: { "If-Match": "*" }, body: JSON.stringify(body) });
+  }
+
+  async function postStep(order, mode, button) {
+    const isInv = mode === "invoice";
+    const stepName = isInv ? "Invoice" : def.stepLabel;
+    const what = isInv
+      ? `Post the invoice for everything already ${def.stepPast} on ${order.number}?\n\nThis posts to the ledger (payables/receivables, tax) and cannot be undone from this portal.`
+      : `${def.stepLabel} ${order.number}?\n\nThis posts the ${def.stepVerb === "ship" ? "shipment" : "receipt"} (inventory moves) without invoicing. You can invoice it afterwards with the Invoice button.`;
+    if (!confirm(what)) return;
+
+    button.disabled = true; setStatus(`${stepName}: preparing ${order.number}...`);
     try {
+      // 1) set the line quantities so only this step gets posted
+      for (const l of qtyLines(order)) {
+        const outstanding = num(l.quantity) - num(l[def.doneQtyKey]);
+        const uninvoiced  = num(l[def.doneQtyKey]) - num(l.invoicedQuantity);
+        // separate PATCHes: setting Qty. to Ship/Receive makes BC recalculate Qty. to Invoice
+        await patchLine(order, l, { [def.stepQtyKey]: isInv ? 0 : outstanding });
+        await patchLine(order, l, { invoiceQuantity: isInv ? uninvoiced : 0 });
+      }
+      // 2) post
+      setStatus(`${stepName}: posting ${order.number}...`);
       await co(`/${def.endpoint}(${order.id})/Microsoft.NAV.${def.postAction}`,
         { method: "POST", headers: { "If-Match": "*" }, body: "{}" });
-      setStatus(`Posted ${order.number}.`, "ok");
+      setStatus(isInv ? `Invoice posted for ${order.number}.` : `${order.number} ${def.stepPast}. Invoice is now unlocked.`, "ok");
       refresh();
       if (refreshers.inventory) delete loaded.inventory;
     } catch (e) {
-      setStatus(`Could not post ${order.number}: ${e.message}`, "err");
+      setStatus(`Could not ${stepName.toLowerCase()} ${order.number}: ${e.message}`, "err");
       button.disabled = false;
+      refresh();
     }
+  }
+
+  function progressText(o) {
+    const lines = qtyLines(o);
+    if (!lines.length) return "No lines";
+    const q = lines.reduce((s, l) => s + num(l.quantity), 0);
+    const d = lines.reduce((s, l) => s + num(l[def.doneQtyKey]), 0);
+    const i = lines.reduce((s, l) => s + num(l.invoicedQuantity), 0);
+    const cap = def.stepPast[0].toUpperCase() + def.stepPast.slice(1);
+    return `${cap} ${d}/${q} · Invoiced ${i}/${q}`;
   }
 
   async function refresh() {
     try {
       listBox.replaceChildren(h("p", { class: "muted" }, "Loading..."));
-      const data = await co(`/${def.endpoint}?$top=50&$orderby=lastModifiedDateTime desc`);
-      renderTable(listBox, def.columns, data.value, [{
-        label: "Action",
-        render: r => {
-          const b = h("button", { type: "button", class: "small" }, def.postLabel);
+      const data = await co(`/${def.endpoint}?$top=50&$orderby=lastModifiedDateTime desc&$expand=${def.linesEndpoint}`);
+      renderTable(listBox, def.columns, data.value, [
+        { label: "Progress", render: r => h("span", { class: "muted" }, progressText(r)) },
+        { label: "Action", render: r => {
           if (r.status === "In Review") {
-            b.disabled = true; b.title = "Waiting for approval";
-            b.textContent = "Awaiting approval";
-          } else {
-            b.addEventListener("click", () => postOrder(r, b));
+            return h("button", { type: "button", class: "small", disabled: true, title: "Waiting for approval" }, "Awaiting approval");
           }
-          return b;
-        }
-      }]);
+          const canStep = toStep(r).length > 0;
+          const canInv  = toInvoice(r).length > 0;
+          const stepBtn = h("button", { type: "button", class: "small",
+            title: canStep ? `Post ${def.stepVerb === "ship" ? "shipment" : "receipt"} only` : `Fully ${def.stepPast}` }, def.stepLabel);
+          const invBtn  = h("button", { type: "button", class: "small",
+            title: canInv ? "Post invoice for " + def.stepPast + " quantities" : `Locked: ${def.stepLabel} first` },
+            canInv ? "Invoice" : "🔒 Invoice");
+          if (canStep) stepBtn.addEventListener("click", () => postStep(r, "step", stepBtn)); else stepBtn.disabled = true;
+          if (canInv)  invBtn.addEventListener("click",  () => postStep(r, "invoice", invBtn)); else invBtn.disabled = true;
+          return h("span", { class: "row-actions", style: "margin:0" }, stepBtn, invBtn);
+        } }
+      ]);
     } catch (e) { listBox.replaceChildren(h("p", { class: "muted" }, "Could not load list: " + e.message)); }
   }
   refreshers[key] = refresh;
