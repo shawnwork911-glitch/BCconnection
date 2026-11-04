@@ -671,7 +671,7 @@ function buildOrder(key) {
   const partyInfo = h("div", { class: "party-info" });
   function showParty(r) {
     if (!r) { partyInfo.replaceChildren(); return; }
-    const blocked = typeof r.blocked === "string" ? r.blocked.trim() : (r.blocked ? "Yes" : "");
+    const blocked = typeof r.blocked === "string" ? r.blocked.replace(/_x0020_/g, " ").trim() : (r.blocked ? "Yes" : "");
     partyInfo.replaceChildren(
       h("div", {}, h("b", {}, `${r.number} — ${r.displayName || ""}`),
         blocked ? h("span", { class: "tag warn", style: "margin-left:.5rem" }, "Blocked: " + blocked) : ""),
