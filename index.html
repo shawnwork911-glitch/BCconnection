@@ -79,6 +79,8 @@
   tr.comment td { color:var(--muted); font-style:italic; background:#fafbfc; }
   table.lines select.vat { margin:0; padding:.35rem; }
   tfoot td { border-bottom:none; }
+  .fx-item { margin-top:.6rem; padding:.5rem .6rem; background:#f7f9fb; border:1px dashed var(--line); border-radius:6px; }
+  input:disabled { background:#eef1f4; color:var(--muted); }
 </style>
 </head>
 <body>
@@ -706,6 +708,7 @@ function buildOrder(key) {
   }
 
   /* PO block: one item -> one line, or one line per month / quarter */
+  const lastFx = { cur: "USD", rate: "", date: "" };   // new items reuse the last BNM rate / date
   function addPoBlock() {
     const blk = { box: h("div", { class: "block" }) };
     const st = { yy: new Date().getFullYear() % 100, from: 0, to: 11, style: "none", unticked: new Set(), over: {} };
@@ -719,6 +722,48 @@ function buildOrder(key) {
     const styleSel = h("select", {}, [["none", "One line, no period"], ["monthly", "One per month"], ["quarterly", "One per quarter"], ["single", "One line for range"]]
       .map(([v, t]) => h("option", { value: v }, t)));
     const cost = h("input", { type: "number", min: "0", step: "any", placeholder: "applies to all lines" });
+
+    // foreign-currency price (MY entity): unit cost = price x BNM rate, FX comment after this item's lines
+    const fxAllowed = companyGroup() === "MY";
+    const fxChk = h("input", { type: "checkbox" });
+    const fxCur = h("input", { value: lastFx.cur, maxlength: "5" });
+    const fxPrice = h("input", { type: "number", min: "0", step: "any", placeholder: "e.g. 0.60" });
+    const fxRate = h("input", { type: "number", min: "0", step: "any", placeholder: "e.g. 4.0260", value: lastFx.rate });
+    const fxDate = h("input", { type: "date", value: lastFx.date });
+    const fxText = h("input", { maxlength: "100" });
+    let fxEdited = false;
+    fxText.addEventListener("input", () => { fxEdited = true; });
+    const fxTpl = COMMENT_TEMPLATES.find(t => t.hint === "fx");
+    function fxCost() { const p = Number(fxPrice.value), r = Number(fxRate.value); return p > 0 && r > 0 ? String(round5(p * r)) : ""; }
+    function fxComment() {
+      const vals = [fxCur.value.trim() || "(currency)", fxPrice.value.trim() || "(price)", fxRate.value.trim() || "(rate)", longDate(fxDate.value) || "(date)"];
+      let i = 0;
+      return fxTpl ? fxTpl.text.replace(TOKEN, () => vals[i++] ?? "")
+                   : `${vals[0]} ${vals[1]} @ BNM RATE ${vals[2]} ON ${vals[3]} AT MIDDLE RATE 1700`;
+    }
+    function fxUpdate() {
+      const on = fxChk.checked;
+      fxBox.classList.toggle("hidden", !on);
+      cost.disabled = on;
+      if (on) {
+        cost.value = fxCost();
+        if (!fxEdited) fxText.value = fxComment();
+        Object.assign(lastFx, { cur: fxCur.value, rate: fxRate.value, date: fxDate.value });
+      }
+      drawPreview();
+    }
+    const fxBox = h("div", { class: "hidden" },
+      h("div", { class: "grid", style: "margin-top:.4rem" },
+        h("label", {}, "Currency", fxCur),
+        h("label", {}, "Price in currency", fxPrice),
+        h("label", {}, "BNM rate", fxRate),
+        h("label", {}, "Rate date", fxDate)),
+      h("label", { style: "margin-top:.4rem" }, "FX comment (added right after this item's lines – you can edit it)", fxText));
+    fxChk.addEventListener("change", fxUpdate);
+    [fxCur, fxPrice, fxRate, fxDate].forEach(e => e.addEventListener("input", fxUpdate));
+    const fxSection = fxAllowed ? h("div", { class: "fx-item" },
+      h("label", { class: "chk" }, fxChk, "Priced in foreign currency (BNM rate) – unit cost = price × rate"), fxBox) : "";
+
     const periodWrap = h("div", {});
     const periodsBox = h("div", { class: "periods" });
     const preview = h("div", { class: "tablewrap" });
@@ -779,6 +824,7 @@ function buildOrder(key) {
         h("label", {}, "From", fromSel),
         h("label", {}, "To", toSel),
         h("label", {}, def.priceLabel, cost)),
+      fxSection,
       periodWrap,
       h("div", { style: "margin-top:.5rem" }, preview));
     redraw();
@@ -791,14 +837,22 @@ function buildOrder(key) {
       if (!ticked().length) return `${item.value}: tick at least one period.`;
       const long = ticked().map(x => (st.over[x.label] || {}).desc ?? descFor(x.label)).find(d => d.length > 100);
       if (long) return `Description too long (max 100): ${long}`;
+      if (fxAllowed && fxChk.checked) {
+        if (!(Number(fxPrice.value) > 0) || !(Number(fxRate.value) > 0) || !fxDate.value) return `${item.value}: fill in currency price, BNM rate and rate date.`;
+        if (!fxText.value.trim()) return `${item.value}: the FX comment is empty.`;
+      }
       return null;
     };
-    blk.lines = () => ticked().map(x => {
-      const o = st.over[x.label] || {};
-      return { lineType: "Item", item: item.value, description: String(o.desc ?? descFor(x.label)).trim(),
-               qty: String(o.qty ?? "").trim(), cost: String(o.cost ?? cost.value).trim(),
-               locationCode: rl.loc.value.trim(), vat: o.vat || orderVat.value, dims: DIMENSIONS };
-    });
+    blk.lines = () => {
+      const out = ticked().map(x => {
+        const o = st.over[x.label] || {};
+        return { lineType: "Item", item: item.value, description: String(o.desc ?? descFor(x.label)).trim(),
+                 qty: String(o.qty ?? "").trim(), cost: String(o.cost ?? cost.value).trim(),
+                 locationCode: rl.loc.value.trim(), vat: o.vat || orderVat.value, dims: DIMENSIONS };
+      });
+      if (fxAllowed && fxChk.checked) out.push({ lineType: "Comment", description: fxText.value.trim() });
+      return out;
+    };
     blocks.push(blk); blocksBox.append(blk.box);
   }
 
@@ -1029,6 +1083,7 @@ function buildOrder(key) {
 
     const lines = [
       ...blocks.flatMap(b => b.lines()).map(l => {
+        if (l.lineType === "Comment") return { ...l, flags: [] };
         const it = itemMap.get(l.item.toLowerCase());
         const flags = [];
         if (!(Number(l.qty) > 0)) flags.push("qty pending");
@@ -1051,7 +1106,9 @@ function buildOrder(key) {
 
   function showPreview(p) {
     const items = p.lines.filter(l => l.lineType === "Item");
-    const total = items.reduce((s, l) => s + num(l.qty) * num(l.cost), 0);
+    const amt = l => Math.round(num(l.qty) * num(l.cost) * 100) / 100;   // BC rounds line amounts to 2 decimals
+    const total = items.reduce((s, l) => s + amt(l), 0);
+    const totalQty = items.reduce((s, l) => s + num(l.qty), 0);
     const dimText = Object.entries(DIMENSIONS).map(([k, v]) => `${k} ${v}`).join(" · ");
     previewCard.replaceChildren(
       h("div", { class: "card-head" }, h("h2", {}, `Preview – draft ${def.title.replace(/s$/, "")}`),
@@ -1068,10 +1125,12 @@ function buildOrder(key) {
           : h("tr", {},
               h("td", {}, i + 1), h("td", {}, "Item"), h("td", {}, l.item), h("td", { class: "wrap" }, l.description || h("span", { class: "muted" }, "(from item card)")),
               h("td", {}, l.locationCode), h("td", { class: "num" }, l.qty === "" ? "–" : fmtNum(l.qty)), h("td", {}, l.uom),
-              h("td", { class: "num" }, l.cost === "" ? "–" : fmtNum(l.cost)), h("td", { class: "num" }, l.qty && l.cost ? fmtNum(round5(num(l.qty) * num(l.cost))) : "–"),
+              h("td", { class: "num" }, l.cost === "" ? "–" : fmtNum(l.cost)), h("td", { class: "num" }, l.qty && l.cost ? amt(l).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : "–"),
               h("td", {}, l.vat), h("td", {}, l.flags.length ? l.flags.map(f => h("span", { class: "tag warn" }, f)) : h("span", { class: "tag ok" }, "OK"))))),
-        h("tfoot", {}, h("tr", {}, h("td", { colspan: 8, class: "num" }, h("b", {}, "Total excl. VAT")),
-          h("td", { class: "num" }, h("b", {}, fmtNum(round5(total)))), h("td", { colspan: 2 }, ""))))),
+        h("tfoot", {}, h("tr", {}, h("td", { colspan: 5, class: "num" }, h("b", {}, "Total")),
+          h("td", { class: "num" }, h("b", {}, fmtNum(round5(totalQty)))), h("td", {}, ""),
+          h("td", { class: "num muted" }, "excl. VAT"),
+          h("td", { class: "num" }, h("b", {}, total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }))), h("td", { colspan: 2 }, ""))))),
       h("div", { class: "row-actions" },
         h("button", { type: "button", class: "ghost", onclick: backToEdit }, "← Back to edit"),
         saveBtn));
