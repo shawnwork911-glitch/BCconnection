@@ -26,6 +26,7 @@
   .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:.75rem; align-items:end; }
   label { display:block; font-size:.8rem; color:var(--muted); }
   label.chk { display:inline-flex; align-items:center; gap:.3rem; color:var(--text); font-size:.85rem; margin:0 .9rem .4rem 0; }
+  textarea { width:100%; padding:.5rem; border:1px solid var(--line); border-radius:4px; font:.85rem/1.4 ui-monospace, Consolas, monospace; resize:vertical; }
   input, select { width:100%; padding:.5rem; margin-top:.2rem; border:1px solid var(--line); border-radius:4px; font-size:.9rem; font-family:inherit; }
   input[type=checkbox] { width:auto; margin:0 .3rem 0 0; }
   button { padding:.5rem 1rem; cursor:pointer; border-radius:4px; border:1px solid var(--accent); background:var(--accent); color:#fff; font-family:inherit; }
@@ -294,7 +295,8 @@ function searchBox({ placeholder, source, onPick, extra }) {
   const input = h("input", { type: "text", placeholder, autocomplete: "off", spellcheck: "false" });
   const list = h("div", { class: "ta-list hidden" });
   const el = h("div", { class: "ta" }, input, list);
-  let rows = [], active = -1, picked = null, timer = null;
+  const MAX_SHOWN = 30;    // only the first 30 matches are listed; typing narrows the list
+  let rows = [], total = 0, active = -1, picked = null, timer = null;
 
   const hay = r => [r.number, r.displayName, r.city].filter(Boolean).join(" ").toLowerCase();
   function hide() { list.classList.add("hidden"); active = -1; }
@@ -305,14 +307,16 @@ function searchBox({ placeholder, source, onPick, extra }) {
   function draw() {
     if (document.activeElement !== input) { hide(); return; }
     list.replaceChildren(...(rows.length
-      ? rows.map((r, i) => h("div", {
+      ? [...rows.map((r, i) => h("div", {
           class: "ta-opt" + (i === active ? " active" : ""),
           onmousedown: e => { e.preventDefault(); pick(r); }
         }, h("b", {}, r.number), " — ", r.displayName || "",
            r.city ? h("span", { class: "muted" }, " · " + r.city) : "",
-           extra && extra(r) ? h("span", { class: "muted" }, " · " + extra(r)) : ""))
+           extra && extra(r) ? h("span", { class: "muted" }, " · " + extra(r)) : ""))]
       : [h("div", { class: "ta-empty" }, "No match.")]));
     list.classList.remove("hidden");
+    const act = list.querySelector(".ta-opt.active");
+    if (act) act.scrollIntoView({ block: "nearest" });
   }
   async function update() {
     if (document.activeElement !== input) return;
@@ -323,7 +327,9 @@ function searchBox({ placeholder, source, onPick, extra }) {
     try { data = await source(); }
     catch (e) { list.replaceChildren(h("div", { class: "ta-empty" }, "Could not load list: " + e.message)); return; }
     if (document.activeElement !== input) { hide(); return; }
-    rows = (tokens.length ? data.filter(r => { const s = hay(r); return tokens.every(t => s.includes(t)); }) : data).slice(0, 30);
+    const all = tokens.length ? data.filter(r => { const s = hay(r); return tokens.every(t => s.includes(t)); }) : data;
+    rows = all.slice(0, MAX_SHOWN);
+    total = all.length;
     active = rows.length ? 0 : -1;
     draw();
   }
@@ -797,7 +803,7 @@ function buildOrder(key) {
   }
 
   /* SO line: find the part no. directly, or from an ID (last 4-5 digits + year) */
-  function addSoLine() {
+  function addSoLine(pre) {
     const blk = { box: h("div", { class: "block" }) };
     const o = {};
     const item = searchBox({ placeholder: "Search part no. or description", source: lookups.items, extra: r => r.baseUnitOfMeasureCode,
@@ -860,9 +866,103 @@ function buildOrder(key) {
     };
     blk.lines = () => [{ lineType: "Item", item: item.value, description: desc.value.trim(), qty: qty.value.trim(), cost: price.value.trim(),
                          locationCode: rl.loc.value.trim(), vat: o.vat || orderVat.value, dims: DIMENSIONS }];
+    blk.isEmpty = () => !item.value && !qty.value && !price.value;
+    if (pre) {
+      item.set(pre.rec.number); applyItem(pre.rec);
+      if (pre.qty) qty.value = pre.qty;
+      if (pre.price) price.value = pre.price;
+      if (pre.id) idIn.value = pre.id;
+    }
     blocks.push(blk); blocksBox.append(blk.box);
   }
   const addBlock = isPO ? addPoBlock : addSoLine;
+
+  /* ---- SO: paste a list from Excel (ID or part no. | quantity | unit price) ---- */
+  const pasteBox = h("div", { class: "fx hidden" });
+  const pasteToggle = isPO ? "" : h("button", { type: "button", class: "ghost",
+    onclick: () => { pasteBox.classList.toggle("hidden"); if (!pasteBox.classList.contains("hidden")) pasteBox.querySelector("textarea").focus(); } },
+    "📋 Paste from Excel");
+  if (!isPO) {
+    const ta = h("textarea", { rows: "6", spellcheck: "false",
+      placeholder: "Copy rows from Excel and paste here.\nColumns: ID or part no.  |  Quantity  |  " + def.priceLabel + "   (quantity and price are optional)" });
+    const pYear = h("input", { type: "number", min: "0", max: "99", placeholder: "e.g. 25" });
+    const results = h("div", { style: "margin-top:.6rem" });
+    const toNum = v => { const x = String(v || "").replace(/,/g, "").trim(); return x !== "" && !isNaN(Number(x)) ? x : ""; };
+    let checked = [];
+
+    async function check() {
+      const rows = ta.value.split(/\r?\n/).map(l => l.split("\t").map(c => c.trim())).filter(c => c[0]);
+      // skip a header row such as "ID | Quantity | Price"
+      if (rows.length && (/^(id|part\s*no\.?|part\s*number|item|no\.?)$/i.test(rows[0][0]) || rows[0].slice(1).some(c => c && toNum(c) === ""))) rows.shift();
+      if (!rows.length) { results.replaceChildren(h("p", { class: "muted small" }, "Nothing to check – paste some rows first.")); return; }
+      results.replaceChildren(h("p", { class: "muted small" }, "Checking..."));
+      let items;
+      try { items = await lookups.items(); }
+      catch (e) { results.replaceChildren(h("p", { class: "tag warn" }, "Could not load items: " + e.message)); return; }
+      checked = rows.map(c => {
+        const val = c[0];
+        const exact = items.find(i => String(i.number).toLowerCase() === val.toLowerCase());
+        const matches = exact ? [exact] : matchItemsById(val, pYear.value, items);
+        return { val, qty: toNum(c[1]), price: toNum(c[2]), matches, pick: matches.length === 1 ? matches[0] : null };
+      });
+      drawResults();
+    }
+    function drawResults() {
+      const nFound = checked.filter(r => r.pick).length;
+      const nMulti = checked.filter(r => !r.pick && r.matches.length > 1).length;
+      const nNone = checked.filter(r => !r.matches.length).length;
+      const addBtn = h("button", { type: "button", disabled: !nFound, onclick: addFound }, `Add ${nFound} found line(s)`);
+      const copyBtn = h("button", { type: "button", class: "ghost", disabled: !nNone, onclick: copyNotFound }, "Copy not-found list");
+      results.replaceChildren(
+        h("div", { class: "small", style: "margin-bottom:.4rem" },
+          h("span", { class: "tag ok" }, `${nFound} found`),
+          nMulti ? h("span", { class: "tag warn" }, `${nMulti} need a choice`) : "",
+          nNone ? h("span", { class: "tag warn" }, `${nNone} not created in BC yet`) : ""),
+        h("div", { class: "tablewrap" }, h("table", { class: "lines" },
+          h("thead", {}, h("tr", {}, ["#", "Pasted", "Status", "Part no.", "Description", "Quantity", def.priceLabel].map(t => h("th", {}, t)))),
+          h("tbody", {}, checked.map((r, i) => {
+            let status, partCell;
+            if (r.pick) {
+              status = h("span", { class: "tag ok" }, "✓ Found");
+              partCell = r.matches.length > 1 ? null : r.pick.number;
+            } else if (r.matches.length > 1) status = h("span", { class: "tag warn" }, `${r.matches.length} matches`);
+            else status = h("span", { class: "tag warn" }, "✕ Not created in BC yet");
+            if (r.matches.length > 1) {
+              partCell = h("select", {}, h("option", { value: "" }, "(choose)"),
+                r.matches.map(m => h("option", { value: m.number, selected: r.pick === m }, m.number)));
+              partCell.addEventListener("change", () => { r.pick = r.matches.find(m => m.number === partCell.value) || null; drawResults(); });
+            }
+            return h("tr", {}, h("td", {}, i + 1), h("td", {}, r.val), h("td", {}, status), h("td", {}, partCell || "–"),
+              h("td", { class: "wrap" }, r.pick ? r.pick.displayName || "" : ""), h("td", { class: "num" }, r.qty || "–"), h("td", { class: "num" }, r.price || "–"));
+          })))),
+        h("div", { class: "row-actions" }, addBtn, copyBtn,
+          nNone ? h("button", { type: "button", class: "ghost", onclick: () => showTab("items") }, "Go to Part Number tab") : ""));
+    }
+    function addFound() {
+      const picked = checked.filter(r => r.pick);
+      blocks.filter(b => b.isEmpty && b.isEmpty()).forEach(removeBlock);      // drop the empty starter line
+      picked.forEach(r => addSoLine({ rec: r.pick, qty: r.qty, price: r.price, id: r.pick.number.toLowerCase() === r.val.toLowerCase() ? "" : r.val }));
+      const left = checked.length - picked.length;
+      setStatus(`Added ${picked.length} line(s) from the pasted list.` + (left ? ` ${left} row(s) were not added (not found or not chosen).` : ""), left ? "warn" : "ok");
+      checked = checked.filter(r => !r.pick);
+      if (checked.length) drawResults(); else { ta.value = ""; results.replaceChildren(); pasteBox.classList.add("hidden"); }
+    }
+    function copyNotFound() {
+      const list = checked.filter(r => !r.matches.length).map(r => r.val).join("\n");
+      (navigator.clipboard ? navigator.clipboard.writeText(list) : Promise.reject())
+        .then(() => setStatus("Not-found list copied – paste it into Excel.", "ok"))
+        .catch(() => { ta.value = list; ta.select(); setStatus("Could not copy automatically – the list is selected in the box, press Ctrl+C.", "warn"); });
+    }
+    pasteBox.append(
+      h("h2", {}, "Paste from Excel"),
+      ta,
+      h("div", { class: "grid", style: "margin-top:.5rem" },
+        h("label", {}, "Year for IDs (2 digits, optional)", pYear),
+        h("div", { class: "row-actions", style: "margin:0" },
+          h("button", { type: "button", onclick: check }, "Check against BC"),
+          h("button", { type: "button", class: "ghost", onclick: () => { ta.value = ""; checked = []; results.replaceChildren(); } }, "Clear"))),
+      results);
+  }
 
   /* ---- comments ---- */
   const comments = [];
@@ -893,7 +993,8 @@ function buildOrder(key) {
       h("label", {}, "VAT Bus. Posting Group (whole order)", orderVat),
       ext ? h("label", {}, def.extLabel, ext) : ""),
     partyInfo,
-    h("h2", { style: "margin-top:1rem" }, "Lines"),
+    h("div", { class: "card-head", style: "margin-top:1rem" }, h("h2", { style: "margin:0" }, "Lines"), pasteToggle),
+    pasteBox,
     blocksBox,
     h("div", { class: "row-actions", style: "margin-top:0" },
       h("button", { type: "button", class: "ghost", onclick: () => addBlock() }, isPO ? "+ Add item" : "+ Add line")),
