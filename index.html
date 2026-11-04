@@ -42,7 +42,7 @@
   td.wrap { white-space:normal; min-width:180px; max-width:280px; }
   table.lines td { padding:.25rem .4rem; }
   table.lines input { margin:0; padding:.35rem .45rem; }
-  table.lines td:first-child { width:60%; }
+  table.lines td:first-child { width:55%; }
   .progress { font-size:.8rem; line-height:1.35; color:var(--muted); }
   .progress .done { color:#14532d; }
   .pager { justify-content:flex-end; }
@@ -71,6 +71,13 @@
   .fx { border:1px dashed var(--line); border-radius:6px; padding:.75rem; margin:.75rem 0; }
   .fx h2 { font-size:.9rem; }
   @media (max-width:640px) { .block-head { flex-wrap:wrap; } }
+  .span2 { grid-column: span 2; }
+  @media (max-width:640px) { .span2 { grid-column: auto; } }
+  .comment-row { border:1px solid var(--line); border-left:4px solid #8a94a6; border-radius:6px; padding:.6rem .75rem; margin-bottom:.6rem; background:#fcfdfe; }
+  .comment-row .block-head { margin-bottom:0; }
+  tr.comment td { color:var(--muted); font-style:italic; background:#fafbfc; }
+  table.lines select.vat { margin:0; padding:.35rem; }
+  tfoot td { border-bottom:none; }
 </style>
 </head>
 <body>
@@ -96,7 +103,7 @@
 <script>
   window.msal || document.write('<script src="msal-browser.min.js"><\/script>');
 </script>
-<!-- PO presets (edit presets.js, not this file) -->
+<!-- Portal settings: registries, locations, VAT groups, comment templates (edit presets.js, not this file) -->
 <script src="presets.js"></script>
 <script>
 /* ============ CONFIGURE THESE ============ */
@@ -112,7 +119,8 @@ const CONFIG = {
 
   // Saxon Portal API extension (sets VAT Bus. Posting Group on PO lines).
   // Leave publisher blank to switch it off.
-  lineExtApi: { publisher: "saxon", group: "portal", version: "v1.0", entity: "purchaseLineExts" },
+  lineExtApi: { publisher: "saxon", group: "portal", version: "v1.0",
+                entities: { po: "purchaseLineExts", so: "salesLineExts" } },
 
   // Approvals need their own custom API page (only used if features.approvals = true).
   approvalApi: {
@@ -132,24 +140,23 @@ if (typeof msal === "undefined") {
   throw new Error("msal library missing");
 }
 
-/* ---------- presets ---------- */
-const PRESET_CFG = window.PORTAL_PRESETS || { presets: [] };
-const PRESETS = (PRESET_CFG.presets || []).map(p => ({
-  ...(PRESET_CFG.defaults || {}), ...p,
-  dimensions: { ...((PRESET_CFG.defaults || {}).dimensions || {}), ...(p.dimensions || {}) }
-}));
+/* ---------- settings (presets.js) ---------- */
+const SETTINGS = window.PORTAL_PRESETS || {};
+const REGISTRIES = SETTINGS.registries || ["I-REC", "TIGR"];
+const COMMENT_TEMPLATES = SETTINGS.comments || [{ label: "Free text", text: "{free:Text}" }];
+const DIMENSIONS = SETTINGS.dimensions || {};
 function companyName() {
   const sel = document.getElementById("company");
   return sel.selectedOptions[0] ? sel.selectedOptions[0].textContent : "";
 }
 function companyGroup() {
   const name = companyName();
-  const g = (PRESET_CFG.companyGroups || []).find(x => new RegExp(x.match, "i").test(name));
+  const g = (SETTINGS.companyGroups || []).find(x => new RegExp(x.match, "i").test(name));
   return g ? g.group : null;
 }
-function presetsForCompany() {
-  const g = companyGroup();
-  return PRESETS.filter(p => p.active !== false && (!g || !p.group || p.group === g));
+function locationFor(registry) {
+  const row = (SETTINGS.locations || {})[registry], g = companyGroup();
+  return row && g ? (row[g] || "") : "";
 }
 
 const BC_SCOPE = ["https://api.businesscentral.dynamics.com/Financials.ReadWrite.All"];
@@ -238,16 +245,17 @@ const lookups = {
   dimensions: () => cached("dimensions", () => coAll("/dimensions?$select=id,code,displayName"))
 };
 
-/* ---------- Saxon Portal API extension ---------- */
-const extState = {};   // companyId -> Promise<boolean>
-function extBase() {
+/* ---------- Saxon Portal API extension (VAT group per line) ---------- */
+const extState = {};   // companyId|kind -> Promise<boolean>
+function extBase(kind) {
   const a = CONFIG.lineExtApi;
-  return `${BC_ROOT}/${a.publisher}/${a.group}/${a.version}/companies(${companyId})/${a.entity}`;
+  return `${BC_ROOT}/${a.publisher}/${a.group}/${a.version}/companies(${companyId})/${a.entities[kind]}`;
 }
-function lineExtAvailable() {
-  if (!CONFIG.lineExtApi.publisher) return Promise.resolve(false);
-  if (!(companyId in extState)) extState[companyId] = bcFetch(extBase() + "?$top=1").then(() => true, () => false);
-  return extState[companyId];
+function lineExtAvailable(kind) {
+  if (!CONFIG.lineExtApi.publisher || !CONFIG.lineExtApi.entities[kind]) return Promise.resolve(false);
+  const k = companyId + "|" + kind;
+  if (!(k in extState)) extState[k] = bcFetch(extBase(kind) + "?$top=1").then(() => true, () => false);
+  return extState[k];
 }
 
 /* ---------- tiny DOM helper ---------- */
@@ -529,27 +537,120 @@ function buildInventory() {
   );
 }
 
-/* ---------- period helpers ---------- */
+/* ---------- text / period helpers ---------- */
 const MONTHS = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
 const MONTH_NAMES = ["JANUARY","FEBRUARY","MARCH","APRIL","MAY","JUNE","JULY","AUGUST","SEPTEMBER","OCTOBER","NOVEMBER","DECEMBER"];
 const round5 = n => Math.round(n * 1e5) / 1e5;
-function longDate(iso) {             // "2026-09-30" -> "30 SEPTEMBER 2026"
-  if (!iso) return "";
-  const [y, m, d] = iso.split("-").map(Number);
-  return `${d} ${MONTH_NAMES[m - 1]} ${y}`;
-}
-/* st = { yy, from, to, style } -> [{label}] */
+const fmtNum = n => Number(Number(n).toFixed(5)).toLocaleString(undefined, { maximumFractionDigits: 5 });
+function longDate(iso)  { if (!iso) return ""; const [y, m, d] = iso.split("-").map(Number); return `${d} ${MONTH_NAMES[m - 1]} ${y}`; }
+function shortDate(iso) { if (!iso) return ""; const [y, m, d] = iso.split("-").map(Number); return `${d} ${MONTHS[m - 1]} ${y}`; }
+const normName = s => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+
+/* st = { yy, from, to, style } -> [{label}] ; style "none" = no period text */
 function periodsFor(st) {
   const yy = String(st.yy).padStart(2, "0");
   const lab = (a, b) => a === b ? `${MONTHS[a]} ${yy}` : `${MONTHS[a]}-${MONTHS[b]} ${yy}`;
   const out = [];
+  if (st.style === "none") return [{ label: "" }];
   if (st.from > st.to) return out;
   if (st.style === "single") out.push({ label: lab(st.from, st.to) });
   else if (st.style === "quarterly") for (let m = st.from; m <= st.to; m += 3) out.push({ label: lab(m, Math.min(m + 2, st.to)) });
   else for (let m = st.from; m <= st.to; m++) out.push({ label: lab(m, m) });
   return out;
 }
-const normName = s => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+/* "MALAYSIA SOLAR RECS V26 (TIGR)" -> "TIGR" (matched against the registry list) */
+function registryFromText(t) {
+  const m = String(t || "").match(/\(([^()]+)\)\s*$/);
+  if (!m) return "";
+  const n = normName(m[1]);
+  return REGISTRIES.find(r => normName(r) === n) || "";
+}
+function vintageFrom(item) {
+  const m = String(item.displayName || "").match(/\bV(\d{2})\b/) || String(item.number || "").match(/_V(\d{2})$/i);
+  return m ? m[1] : "";
+}
+/* SO: ID -> part numbers. Uses the last 5 (or 4) digits of the ID and, if given, the 2-digit year. */
+function matchItemsById(id, yy, items) {
+  const m = String(id || "").match(/(\d+)\D*$/);
+  if (!m) return [];
+  const tail = m[1];
+  const keys = new Set([tail.slice(-5), tail.slice(-4)].filter(k => k.length >= 4).map(Number));
+  const y = String(yy || "").trim().slice(-2);
+  return items.filter(it => {
+    const num = String(it.number || "");
+    const d = num.match(/\d+/);
+    if (!d || !keys.has(Number(d[0]))) return false;
+    return !y || new RegExp(`_V${y}$`, "i").test(num);
+  });
+}
+
+/* ---------- comment lines (templates from presets.js) ---------- */
+const TOKEN = /\{(\w+):([^}=]+)(?:=([^}]*))?\}/g;
+function makeCommentRow(onRemove, onMove) {
+  const row = {};
+  const tplSel = h("select", {}, COMMENT_TEMPLATES.map((t, i) => h("option", { value: i }, t.label || t.text)));
+  const fieldsBox = h("div", { class: "grid", style: "margin-top:.4rem" });
+  const out = h("input", { maxlength: "100", placeholder: "Comment text" });
+  const hint = h("div", { class: "muted small" });
+  let edited = false, fields = [];
+  out.addEventListener("input", () => { edited = true; resetBtn.classList.remove("hidden"); });
+  const resetBtn = h("button", { type: "button", class: "ghost small hidden", title: "Rebuild text from the boxes",
+    onclick: () => { edited = false; resetBtn.classList.add("hidden"); regen(); } }, "↺");
+
+  function fmt(f) {
+    const v = f.el.value.trim();
+    if (!v) return "";
+    if (f.type === "percent") return v.replace(/%$/, "") + "%";
+    if (f.type === "date") return shortDate(v);
+    if (f.type === "longdate") return longDate(v);
+    return v;
+  }
+  function regen() {
+    const tpl = COMMENT_TEMPLATES[tplSel.value];
+    let i = 0;
+    if (!edited) out.value = tpl.text.replace(TOKEN, () => { const f = fields[i++]; return fmt(f) || `(${f.label})`; });
+    hint.textContent = "";
+    if (tpl.hint === "fx") {
+      const nums = fields.filter(f => f.type === "number").map(f => Number(f.el.value));
+      if (nums[0] > 0 && nums[1] > 0) hint.textContent = `${nums[0]} × ${nums[1]} = ${round5(nums[0] * nums[1])} per unit`;
+    }
+  }
+  function build() {
+    const tpl = COMMENT_TEMPLATES[tplSel.value];
+    fields = [...tpl.text.matchAll(TOKEN)].map(([, type, label, def]) => {
+      let el;
+      if (type === "date" || type === "longdate") el = h("input", { type: "date" });
+      else if (type === "registry") el = h("select", {}, h("option", { value: "" }, "(choose)"), REGISTRIES.map(r => h("option", { value: r }, r)));
+      else if (type === "number" || type === "percent") el = h("input", { type: "number", step: "any", min: "0", value: def });
+      else el = h("input", { value: def, maxlength: "100" });
+      el.addEventListener("input", regen); el.addEventListener("change", regen);
+      return { type, label, el };
+    });
+    fieldsBox.replaceChildren(...fields.map(f => h("label", {}, f.label + (f.type === "percent" ? " (%)" : ""), f.el)));
+    edited = false; resetBtn.classList.add("hidden");
+    regen();
+  }
+  tplSel.addEventListener("change", build);
+
+  row.box = h("div", { class: "comment-row" },
+    h("div", { class: "block-head" },
+      h("label", { class: "grow" }, "Comment", tplSel),
+      h("button", { type: "button", class: "ghost small", title: "Move up", onclick: () => onMove(row, -1) }, "↑"),
+      h("button", { type: "button", class: "ghost small", title: "Move down", onclick: () => onMove(row, 1) }, "↓"),
+      h("button", { type: "button", class: "ghost small", title: "Remove", onclick: () => onRemove(row) }, "✕")),
+    fieldsBox,
+    h("label", { style: "margin-top:.4rem" }, "Text written to BC (you can edit it)",
+      h("div", { style: "display:flex;gap:.4rem;align-items:center" }, out, resetBtn)),
+    hint);
+  row.text = () => out.value.trim();
+  row.validate = () => {
+    if (!row.text()) return "A comment line is empty.";
+    if (!edited && fields.some(f => !f.el.value.trim())) return `Fill in the boxes of comment "${COMMENT_TEMPLATES[tplSel.value].label}".`;
+    return null;
+  };
+  build();
+  return row;
+}
 
 /* ---------- order tab (PO / SO) ---------- */
 function buildOrder(key) {
@@ -557,8 +658,10 @@ function buildOrder(key) {
   const isPO = key === "po";
   const listBox = h("div", { class: "tablewrap" });
   const num = v => Number(v) || 0;
+  const VAT_LIST = ((SETTINGS.vatGroups || {})[key]) || ["LOCAL", "EXPORT"];
+  const vatOptions = sel => VAT_LIST.map(v => h("option", { value: v, selected: v === sel }, v));
 
-  /* ---- header: supplier / customer search ---- */
+  /* ---- header ---- */
   const partyInfo = h("div", { class: "party-info" });
   function showParty(r) {
     if (!r) { partyInfo.replaceChildren(); return; }
@@ -570,90 +673,63 @@ function buildOrder(key) {
       h("div", { class: "muted" }, [r.email, r.phoneNumber, r.currencyCode ? "Currency " + r.currencyCode : "Local currency"].filter(Boolean).join(" · ")));
   }
   const party = searchBox({ placeholder: `Type ${def.partyLabel.toLowerCase()} no., name or city`, source: lookups[def.partyLookup], onPick: showParty });
-
   const today = new Date().toISOString().slice(0, 10);
   const date = h("input", { type: "date", value: today });
   const ext  = def.extKey ? h("input", {}) : null;
-  const btn  = h("button", { type: "submit" }, "Save draft " + def.title.replace(/s$/, ""));
+  const orderVat = h("select", {}, h("option", { value: "" }, "(choose)"), vatOptions(""));
+  orderVat.addEventListener("change", () => blocks.forEach(b => b.refresh()));
 
-  /* ---- FX (PO, USD-priced presets) ---- */
-  const fxRate = h("input", { type: "number", step: "any", min: "0", placeholder: "e.g. 4.0795" });
-  const fxDate = h("input", { type: "date" });
-  const fxMid  = h("input", { value: PRESET_CFG.fxMiddleRate || "1700" });
-  const fx = { rate: () => Number(fxRate.value) || 0 };
-  function fxComment(usd) {
-    return `USD ${Number(usd).toFixed(2)} @ BNM RATE ${fxRate.value.trim() || "?"} ON ${longDate(fxDate.value) || "?"} AT MIDDLE RATE ${fxMid.value.trim()}`;
-  }
-  const fxBox = h("div", { class: "fx hidden" },
-    h("h2", {}, "FX for USD-priced lines"),
-    h("div", { class: "grid" },
-      h("label", {}, "BNM rate", fxRate),
-      h("label", {}, "Rate date", fxDate),
-      h("label", {}, "Middle rate (comment text)", fxMid)),
-    h("p", { class: "muted small", style: "margin:.5rem 0 0" },
-      "Unit cost = USD price × BNM rate (rounded to 5 decimals). A comment line with the rate is added after each USD block."));
-  [fxRate, fxDate, fxMid].forEach(e => e.addEventListener("input", () => blocks.forEach(b => b.refresh())));
-
-  /* ---- item blocks ---- */
+  /* ---- lines ---- */
   const blocks = [];
   const blocksBox = h("div", {});
-  function fxVisibility() { fxBox.classList.toggle("hidden", !blocks.some(b => b.usesFx())); }
+  function removeBlock(blk) { blocks.splice(blocks.indexOf(blk), 1); blk.box.remove(); }
 
-  function manualContent(blk, body) {
-    const item = searchBox({ placeholder: "Search part no. or description", source: lookups.items, extra: r => r.baseUnitOfMeasureCode });
-    const desc = h("input", { placeholder: "(from item card)", maxlength: "100" });
-    const qty = h("input", { type: "number", min: "0", step: "any", value: "1" });
-    const price = h("input", { type: "number", min: "0", step: "any" });
-    body.replaceChildren(h("div", { class: "grid" },
-      h("label", {}, "Part no.", item.el),
-      h("label", {}, "Description (optional)", desc),
-      h("label", {}, "Quantity (blank = later)", qty),
-      h("label", {}, def.priceLabel + " (optional)", price)));
-    blk.usesFx = () => false;
-    blk.refresh = () => {};
-    blk.items = () => [item.value];
-    blk.validate = () => item.value ? null : "Every line needs a part no.";
-    blk.lines = () => [{ lineType: "Item", item: item.value, description: desc.value.trim(), qty: qty.value.trim(), cost: price.value.trim() }];
+  // VAT select for one line: follows the order VAT unless the user changes it
+  function lineVatSelect(o) {
+    const s = h("select", { class: "vat" }, vatOptions(o.vat || orderVat.value));
+    if (!o.vat && !orderVat.value) s.prepend(h("option", { value: "", selected: true }, "(order)"));
+    s.addEventListener("change", () => { o.vat = s.value; });
+    return s;
+  }
+  // registry + location pair; location fills from the settings table
+  function registryLocation(onChange) {
+    const reg = h("select", {}, h("option", { value: "" }, "(none)"), REGISTRIES.map(r => h("option", { value: r }, r)));
+    const loc = h("input", { placeholder: "Location code" });
+    reg.addEventListener("change", () => { loc.value = locationFor(reg.value); onChange && onChange(); });
+    return { reg, loc, set(r) { reg.value = r || ""; loc.value = locationFor(reg.value); } };
   }
 
-  function presetContent(blk, body, p) {
-    const usdMode = !!(p.price && (p.price.currency === "USD" || p.price.usd !== undefined));
-    const st = {
-      yy: p.year ?? (new Date().getFullYear() % 100),
-      from: Math.max(0, MONTHS.indexOf(p.from || "JAN")),
-      to: MONTHS.indexOf(p.to || "DEC") < 0 ? 11 : MONTHS.indexOf(p.to || "DEC"),
-      style: p.style || "monthly",
-      unticked: new Set(), over: {}
-    };
-    const item = searchBox({ placeholder: "Search part no.", source: lookups.items, extra: r => r.baseUnitOfMeasureCode });
-    item.input.value = p.item || "";
+  /* PO block: one item -> one line, or one line per month / quarter */
+  function addPoBlock() {
+    const blk = { box: h("div", { class: "block" }) };
+    const st = { yy: new Date().getFullYear() % 100, from: 0, to: 11, style: "none", unticked: new Set(), over: {} };
+    const item = searchBox({ placeholder: "Search part no. or description", source: lookups.items, extra: r => r.baseUnitOfMeasureCode,
+      onPick: r => { if (r) applyItem(r); } });
+    const base = h("input", { maxlength: "100", placeholder: "Filled from the item" });
+    const rl = registryLocation(() => redraw());
     const yy = h("input", { type: "number", min: "0", max: "99", value: st.yy });
     const mSel = v => h("select", {}, MONTHS.map((m, i) => h("option", { value: i, selected: i === v }, m)));
-    const fromSel = mSel(st.from), toSel = mSel(st.to);
-    const styleSel = h("select", {}, [["monthly", "One per month"], ["quarterly", "One per quarter"], ["single", "One line for range"]]
-      .map(([v, t]) => h("option", { value: v, selected: v === st.style }, t)));
-    const priceIn = h("input", { type: "number", min: "0", step: "any",
-      placeholder: usdMode ? "e.g. 1.30" : "applies to all lines" });
-    const costNote = h("div", { class: "muted small", style: "margin-top:.4rem" });
+    const fromSel = mSel(0), toSel = mSel(11);
+    const styleSel = h("select", {}, [["none", "One line, no period"], ["monthly", "One per month"], ["quarterly", "One per quarter"], ["single", "One line for range"]]
+      .map(([v, t]) => h("option", { value: v }, t)));
+    const cost = h("input", { type: "number", min: "0", step: "any", placeholder: "applies to all lines" });
+    const periodWrap = h("div", {});
     const periodsBox = h("div", { class: "periods" });
     const preview = h("div", { class: "tablewrap" });
-    const info = h("div", { class: "muted small", style: "margin-top:.3rem" },
-      [`Location ${p.location || "-"}`, `VAT group ${p.vatBusPostingGroup || "-"}`,
-       ...Object.entries(p.dimensions || {}).map(([k, v]) => `${k} ${v}`)].join(" · "));
 
-    const descFor = label => `${p.description} - ${label}`;
-    function baseCost() {
-      if (usdMode) { const r = fx.rate(), u = Number(priceIn.value); return r > 0 && u > 0 ? round5(u * r) : ""; }
-      return priceIn.value.trim() === "" ? "" : Number(priceIn.value);
+    function applyItem(r) {
+      base.value = r.displayName || "";
+      rl.set(registryFromText(r.displayName));
+      const v = vintageFrom(r); if (v) yy.value = Number(v);
+      redraw();
     }
+    const descFor = label => label ? `${base.value.trim()} - ${label}` : base.value.trim();
     const ticked = () => periodsFor(st).filter(x => !st.unticked.has(x.label));
 
     function redraw() {
       st.yy = Number(yy.value) || 0; st.from = Number(fromSel.value); st.to = Number(toSel.value); st.style = styleSel.value;
-      const bcost = baseCost();
-      costNote.textContent = usdMode
-        ? (bcost !== "" ? `${def.priceLabel} per line = ${bcost} (USD ${priceIn.value} × BNM ${fxRate.value})` : "Enter the BNM rate in the FX box to calculate the unit cost.")
-        : "";
+      [yy, fromSel, toSel].forEach(e => e.closest("label").classList.toggle("hidden", st.style === "none"));
+      periodWrap.classList.toggle("hidden", st.style === "none");
       const ps = periodsFor(st);
       periodsBox.replaceChildren(...(ps.length ? ps.map(x => {
         const cb = h("input", { type: "checkbox", checked: !st.unticked.has(x.label) });
@@ -663,112 +739,259 @@ function buildOrder(key) {
       drawPreview();
     }
     function drawPreview() {
-      const bcost = baseCost(), rows = ticked();
+      const rows = ticked();
       if (!rows.length) { preview.replaceChildren(h("p", { class: "muted small" }, "No periods ticked.")); return; }
       preview.replaceChildren(h("table", { class: "lines" },
-        h("thead", {}, h("tr", {}, h("th", {}, "Description"), h("th", {}, "Quantity"), h("th", {}, def.priceLabel))),
+        h("thead", {}, h("tr", {}, h("th", {}, "Description"), h("th", {}, "Quantity"), h("th", {}, def.priceLabel), h("th", {}, "VAT group"))),
         h("tbody", {}, rows.map(x => {
           const o = st.over[x.label] || (st.over[x.label] = {});
           const d = h("input", { value: o.desc ?? descFor(x.label), maxlength: "100" });
           d.addEventListener("input", () => o.desc = d.value);
           const q = h("input", { type: "number", min: "0", step: "any", value: o.qty ?? "", placeholder: "later" });
           q.addEventListener("input", () => o.qty = q.value);
-          const c = h("input", { type: "number", min: "0", step: "any", value: o.cost ?? bcost, placeholder: usdMode ? "needs USD price + rate" : "enter cost" });
+          const c = h("input", { type: "number", min: "0", step: "any", value: o.cost ?? cost.value, placeholder: "enter cost" });
           c.addEventListener("input", () => o.cost = c.value);
-          return h("tr", {}, h("td", {}, d), h("td", {}, q), h("td", {}, c));
+          return h("tr", {}, h("td", {}, d), h("td", {}, q), h("td", {}, c), h("td", {}, lineVatSelect(o)));
         }))));
-      if (usdMode) preview.append(h("p", { class: "muted small", style: "margin:.4rem 0 0" }, "+ comment line: ", h("code", {}, fxComment(priceIn.value || 0))));
     }
     yy.addEventListener("input", redraw);
     [fromSel, toSel, styleSel].forEach(s => s.addEventListener("change", redraw));
-    priceIn.addEventListener("input", redraw);
+    [base, cost].forEach(e => e.addEventListener("input", drawPreview));
 
-    body.replaceChildren(
+    periodWrap.append(h("div", { class: "sub" }, "Periods"), periodsBox);
+    blk.box.append(
+      h("div", { class: "block-head" }, h("strong", { class: "grow" }, "Item"),
+        h("button", { type: "button", class: "ghost small", onclick: () => removeBlock(blk) }, "✕ Remove")),
       h("div", { class: "grid" },
         h("label", {}, "Part no.", item.el),
+        h("label", { class: "span2" }, "Description (period is added behind it)", base),
+        h("label", {}, "Registry", rl.reg),
+        h("label", {}, "Location", rl.loc)),
+      h("div", { class: "grid", style: "margin-top:.6rem" },
+        h("label", {}, "Lines", styleSel),
         h("label", {}, "Year (2 digits)", yy),
         h("label", {}, "From", fromSel),
         h("label", {}, "To", toSel),
-        h("label", {}, "Lines", styleSel),
-        h("label", {}, usdMode ? "USD price" : def.priceLabel, priceIn)),
-      costNote, info,
-      h("div", { class: "sub" }, "Periods"), periodsBox, preview);
+        h("label", {}, def.priceLabel, cost)),
+      periodWrap,
+      h("div", { style: "margin-top:.5rem" }, preview));
     redraw();
 
-    blk.usesFx = () => usdMode;
-    blk.refresh = redraw;
+    blk.refresh = drawPreview;
     blk.items = () => [item.value];
     blk.validate = () => {
-      if (!item.value) return `${p.name}: enter the part no.`;
-      if (!ticked().length) return `${p.name}: tick at least one period.`;
-      if (usdMode && !(Number(priceIn.value) > 0)) return `${p.name}: enter the USD price.`;
+      if (!item.value) return "Every item needs a part no.";
+      if (!base.value.trim()) return `${item.value}: description is empty.`;
+      if (!ticked().length) return `${item.value}: tick at least one period.`;
       const long = ticked().map(x => (st.over[x.label] || {}).desc ?? descFor(x.label)).find(d => d.length > 100);
       if (long) return `Description too long (max 100): ${long}`;
       return null;
     };
-    blk.lines = () => {
-      const bcost = baseCost();
-      const out = ticked().map(x => {
-        const o = st.over[x.label] || {};
-        return { lineType: "Item", item: item.value, description: String(o.desc ?? descFor(x.label)).trim(),
-                 qty: String(o.qty ?? "").trim(), cost: String(o.cost ?? bcost).trim(),
-                 locationCode: p.location, vatBus: p.vatBusPostingGroup, dims: p.dimensions };
-      });
-      if (usdMode) out.push({ lineType: "Comment", description: fxComment(priceIn.value) });
-      return out;
-    };
+    blk.lines = () => ticked().map(x => {
+      const o = st.over[x.label] || {};
+      return { lineType: "Item", item: item.value, description: String(o.desc ?? descFor(x.label)).trim(),
+               qty: String(o.qty ?? "").trim(), cost: String(o.cost ?? cost.value).trim(),
+               locationCode: rl.loc.value.trim(), vat: o.vat || orderVat.value, dims: DIMENSIONS };
+    });
+    blocks.push(blk); blocksBox.append(blk.box);
   }
 
-  function addBlock(presetId) {
-    const box = h("div", { class: "block" });
-    const blk = { box, usesFx: () => false, refresh: () => {}, items: () => [], validate: () => null, lines: () => [] };
-    const body = h("div", {});
-    const list = isPO ? presetsForCompany() : [];
-    const presetSel = isPO ? h("select", {},
-      h("option", { value: "" }, "No preset (manual line)"),
-      list.map(p => h("option", { value: p.id }, p.name))) : null;
-    const removeBtn = h("button", { type: "button", class: "ghost small", title: "Remove",
-      onclick: () => { blocks.splice(blocks.indexOf(blk), 1); box.remove(); fxVisibility(); } }, "✕ Remove");
-    function setPreset(id) {
-      const p = list.find(x => x.id === id);
-      if (p) presetContent(blk, body, p); else manualContent(blk, body);
-      fxVisibility();
+  /* SO line: find the part no. directly, or from an ID (last 4-5 digits + year) */
+  function addSoLine() {
+    const blk = { box: h("div", { class: "block" }) };
+    const o = {};
+    const item = searchBox({ placeholder: "Search part no. or description", source: lookups.items, extra: r => r.baseUnitOfMeasureCode,
+      onPick: r => { if (r) applyItem(r); } });
+    const idIn = h("input", { placeholder: "Paste ID" });
+    const idYear = h("input", { type: "number", min: "0", max: "99", placeholder: "e.g. 25" });
+    const idResult = h("div", { class: "small", style: "margin-top:.3rem" });
+    const desc = h("input", { maxlength: "100", placeholder: "Filled from the item" });
+    const rl = registryLocation();
+    const qty = h("input", { type: "number", min: "0", step: "any", placeholder: "later" });
+    const price = h("input", { type: "number", min: "0", step: "any", placeholder: "enter price" });
+    const vatBox = h("span", {});
+    function drawVat() { vatBox.replaceChildren(lineVatSelect(o)); }
+
+    function applyItem(r) { desc.value = r.displayName || ""; rl.set(registryFromText(r.displayName)); }
+    let t;
+    async function findById() {
+      const id = idIn.value.trim();
+      if (!id) { idResult.replaceChildren(); return; }
+      idResult.replaceChildren(h("span", { class: "muted" }, "Searching..."));
+      let found;
+      try { found = matchItemsById(id, idYear.value, await lookups.items()); }
+      catch (e) { idResult.replaceChildren(h("span", { class: "tag warn" }, "Could not load items: " + e.message)); return; }
+      if (!found.length) {
+        idResult.replaceChildren(h("span", { class: "tag warn" }, "Not created in BC yet"), " ",
+          h("button", { type: "button", class: "ghost small", onclick: () => showTab("items") }, "Create it in Part Number tab"));
+        return;
+      }
+      const choose = r => { item.set(r.number); applyItem(r); idResult.replaceChildren(h("span", { class: "tag ok" }, "Found: " + r.number)); };
+      if (found.length === 1) { choose(found[0]); return; }
+      idResult.replaceChildren(h("span", { class: "muted" }, `${found.length} matches – pick one: `),
+        ...found.slice(0, 12).map(r => h("button", { type: "button", class: "ghost small", style: "margin:.15rem", title: r.displayName,
+          onclick: () => choose(r) }, r.number)));
     }
-    if (presetSel) { presetSel.value = presetId || ""; presetSel.addEventListener("change", () => setPreset(presetSel.value)); }
-    box.append(h("div", { class: "block-head" },
-      presetSel ? h("label", { class: "grow" }, "Preset", presetSel) : h("strong", { class: "grow" }, "Line"),
-      removeBtn), body);
-    blocks.push(blk);
-    blocksBox.append(box);
-    setPreset(presetSel ? presetSel.value : "");
-  }
-  function resetBlocks() {
-    blocks.length = 0; blocksBox.replaceChildren();
-    if (isPO) { const first = presetsForCompany()[0]; addBlock(first ? first.id : ""); } else addBlock("");
-  }
-  resetBlocks();
+    [idIn, idYear].forEach(e => e.addEventListener("input", () => { clearTimeout(t); t = setTimeout(findById, 300); }));
 
-  const presetNote = isPO && !PRESETS.length
-    ? h("p", { class: "muted small" }, "presets.js was not found next to index.html, so only manual lines are available.") : "";
+    blk.box.append(
+      h("div", { class: "block-head" }, h("strong", { class: "grow" }, "Line"),
+        h("button", { type: "button", class: "ghost small", onclick: () => removeBlock(blk) }, "✕ Remove")),
+      h("div", { class: "grid" },
+        h("label", {}, "Find by ID (last 4–5 digits)", idIn),
+        h("label", {}, "Year (2 digits, optional)", idYear),
+        h("label", { class: "span2" }, "…or part no.", item.el)),
+      idResult,
+      h("div", { class: "grid", style: "margin-top:.6rem" },
+        h("label", { class: "span2" }, "Description", desc),
+        h("label", {}, "Registry", rl.reg),
+        h("label", {}, "Location", rl.loc),
+        h("label", {}, "Quantity", qty),
+        h("label", {}, def.priceLabel, price),
+        h("label", {}, "VAT group", vatBox)));
+    drawVat();
 
+    blk.refresh = drawVat;
+    blk.items = () => [item.value];
+    blk.validate = () => {
+      if (!item.value) return "Every line needs a part no.";
+      if (desc.value.trim().length > 100) return "Description too long (max 100).";
+      return null;
+    };
+    blk.lines = () => [{ lineType: "Item", item: item.value, description: desc.value.trim(), qty: qty.value.trim(), cost: price.value.trim(),
+                         locationCode: rl.loc.value.trim(), vat: o.vat || orderVat.value, dims: DIMENSIONS }];
+    blocks.push(blk); blocksBox.append(blk.box);
+  }
+  const addBlock = isPO ? addPoBlock : addSoLine;
+
+  /* ---- comments ---- */
+  const comments = [];
+  const commentsBox = h("div", {});
+  function addComment() {
+    const row = makeCommentRow(
+      r => { comments.splice(comments.indexOf(r), 1); r.box.remove(); },
+      (r, dir) => {
+        const i = comments.indexOf(r), j = i + dir;
+        if (j < 0 || j >= comments.length) return;
+        [comments[i], comments[j]] = [comments[j], comments[i]];
+        commentsBox.replaceChildren(...comments.map(c => c.box));
+      });
+    comments.push(row); commentsBox.append(row.box);
+  }
+
+  function resetForm() {
+    form.reset(); date.value = today; party.clear(); orderVat.value = "";
+    blocks.length = 0; blocksBox.replaceChildren(); addBlock();
+    comments.length = 0; commentsBox.replaceChildren();
+  }
+
+  const previewBtn = h("button", { type: "submit" }, "Preview");
   const form = h("form", {},
     h("div", { class: "grid" },
       h("label", {}, def.partyLabel, party.el),
       h("label", {}, "Order date", date),
+      h("label", {}, "VAT Bus. Posting Group (whole order)", orderVat),
       ext ? h("label", {}, def.extLabel, ext) : ""),
     partyInfo,
-    isPO ? fxBox : "",
     h("h2", { style: "margin-top:1rem" }, "Lines"),
-    presetNote,
     blocksBox,
-    h("div", { class: "row-actions" },
-      h("button", { type: "button", class: "ghost", onclick: () => addBlock(isPO && presetsForCompany()[0] ? presetsForCompany()[0].id : "") },
-        isPO ? "+ Add item block" : "+ Add line"),
-      isPO ? h("button", { type: "button", class: "ghost", onclick: () => addBlock("") }, "+ Add manual line") : "",
-      btn)
+    h("div", { class: "row-actions", style: "margin-top:0" },
+      h("button", { type: "button", class: "ghost", onclick: () => addBlock() }, isPO ? "+ Add item" : "+ Add line")),
+    h("h2", { style: "margin-top:1.2rem" }, "Comments (added at the bottom)"),
+    commentsBox,
+    h("div", { class: "row-actions", style: "margin-top:0" },
+      h("button", { type: "button", class: "ghost", onclick: addComment }, "+ Add comment")),
+    h("div", { class: "row-actions", style: "border-top:1px solid var(--line);padding-top:.75rem" }, previewBtn)
   );
+  addBlock();
 
-  /* ---- line helpers ---- */
+  /* ---- preview ---- */
+  const previewCard = h("div", { class: "card hidden preview" });
+  let plan = null;
+
+  async function buildPlan() {
+    const errs = [];
+    if (!party.value) errs.push(`Choose a ${def.partyLabel.toLowerCase()}.`);
+    if (!orderVat.value) errs.push("Choose the VAT Bus. Posting Group for the order.");
+    if (!blocks.length) errs.push("Add at least one line.");
+    blocks.forEach(b => { const e = b.validate(); if (e) errs.push(e); });
+    comments.forEach(c => { const e = c.validate(); if (e) errs.push(e); });
+    if (errs.length) throw new Error(errs.join(" "));
+
+    const [parties, items, locations, extOk] = await Promise.all([
+      lookups[def.partyLookup](), lookups.items(), lookups.locations().catch(() => []), lineExtAvailable(key)]);
+    const partyRec = parties.find(r => (r.number || "").toLowerCase() === party.value.toLowerCase());
+    if (!partyRec) throw new Error(`${def.partyLabel} "${party.value}" not found. Pick one from the search list.`);
+    const itemMap = new Map(items.map(i => [String(i.number).toLowerCase(), i]));
+    const missing = [...new Set(blocks.flatMap(b => b.items()))].filter(n => !itemMap.has(n.toLowerCase()));
+    if (missing.length) throw new Error("Part no. not found in BC: " + missing.join(", "));
+
+    const lines = [
+      ...blocks.flatMap(b => b.lines()).map(l => {
+        const it = itemMap.get(l.item.toLowerCase());
+        const flags = [];
+        if (!(Number(l.qty) > 0)) flags.push("qty pending");
+        if (l.cost === "") flags.push(`no ${def.priceLabel.toLowerCase()}`);
+        let locationId = null;
+        if (l.locationCode) {
+          const loc = locations.find(x => (x.code || "").toLowerCase() === l.locationCode.toLowerCase());
+          if (loc) locationId = loc.id; else flags.push(`location ${l.locationCode} not in BC`);
+        } else flags.push("no location");
+        if (!extOk) flags.push("VAT group to set in BC");
+        if (it.blocked === true) flags.push("item blocked");
+        return { ...l, item: it.number, uom: it.baseUnitOfMeasureCode || "", locationId, flags };
+      }),
+      ...comments.map(c => ({ lineType: "Comment", description: c.text(), flags: [] }))
+    ];
+    return { partyRec, extOk, lines,
+      header: { [def.partyKey]: partyRec.number, ...(date.value ? { orderDate: date.value } : {}),
+                ...(ext && ext.value.trim() ? { [def.extKey]: ext.value.trim() } : {}) } };
+  }
+
+  function showPreview(p) {
+    const items = p.lines.filter(l => l.lineType === "Item");
+    const total = items.reduce((s, l) => s + num(l.qty) * num(l.cost), 0);
+    const dimText = Object.entries(DIMENSIONS).map(([k, v]) => `${k} ${v}`).join(" · ");
+    previewCard.replaceChildren(
+      h("div", { class: "card-head" }, h("h2", {}, `Preview – draft ${def.title.replace(/s$/, "")}`),
+        h("span", { class: "tag" }, "Nothing is written to BC until you click Save")),
+      h("div", { class: "party-info", style: "margin:0 0 .75rem" },
+        h("div", {}, h("b", {}, `${p.partyRec.number} — ${p.partyRec.displayName || ""}`)),
+        h("div", {}, `Company: ${companyName()} · Order date: ${date.value || "(today)"} · VAT group: ${orderVat.value}` +
+          (ext && ext.value.trim() ? ` · ${def.extLabel.replace(/ \(optional\)/, "")}: ${ext.value.trim()}` : "")),
+        dimText ? h("div", { class: "muted" }, "Dimensions on item lines: " + dimText) : ""),
+      h("div", { class: "tablewrap" }, h("table", {},
+        h("thead", {}, h("tr", {}, ["#", "Type", "No.", "Description", "Location", "Quantity", "UoM", def.priceLabel, "Line amount", "VAT group", "Check"].map(t => h("th", {}, t)))),
+        h("tbody", {}, p.lines.map((l, i) => l.lineType === "Comment"
+          ? h("tr", { class: "comment" }, h("td", {}, i + 1), h("td", {}, "Comment"), h("td", {}, ""), h("td", { colspan: 8, class: "wrap" }, l.description), h("td", {}, ""))
+          : h("tr", {},
+              h("td", {}, i + 1), h("td", {}, "Item"), h("td", {}, l.item), h("td", { class: "wrap" }, l.description || h("span", { class: "muted" }, "(from item card)")),
+              h("td", {}, l.locationCode), h("td", { class: "num" }, l.qty === "" ? "–" : fmtNum(l.qty)), h("td", {}, l.uom),
+              h("td", { class: "num" }, l.cost === "" ? "–" : fmtNum(l.cost)), h("td", { class: "num" }, l.qty && l.cost ? fmtNum(round5(num(l.qty) * num(l.cost))) : "–"),
+              h("td", {}, l.vat), h("td", {}, l.flags.length ? l.flags.map(f => h("span", { class: "tag warn" }, f)) : h("span", { class: "tag ok" }, "OK"))))),
+        h("tfoot", {}, h("tr", {}, h("td", { colspan: 8, class: "num" }, h("b", {}, "Total excl. VAT")),
+          h("td", { class: "num" }, h("b", {}, fmtNum(round5(total)))), h("td", { colspan: 2 }, ""))))),
+      h("div", { class: "row-actions" },
+        h("button", { type: "button", class: "ghost", onclick: backToEdit }, "← Back to edit"),
+        saveBtn));
+    form.classList.add("hidden"); previewCard.classList.remove("hidden");
+    previewCard.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+  function backToEdit() { previewCard.classList.add("hidden"); form.classList.remove("hidden"); }
+
+  form.addEventListener("submit", async ev => {
+    ev.preventDefault();
+    previewBtn.disabled = true; setStatus("Checking...");
+    try {
+      plan = await buildPlan();
+      const flagged = plan.lines.filter(l => l.flags.length).length;
+      setStatus(flagged ? `Preview ready – ${flagged} line(s) have notes. Check them, then Save to BC or go back.` : "Preview ready. Check it, then Save to BC.", flagged ? "warn" : "ok");
+      showPreview(plan);
+    } catch (e) { setStatus("Error: " + e.message, "err"); }
+    finally { previewBtn.disabled = false; }
+  });
+
+  /* ---- writing to BC ---- */
   const lineUrl = (order, line) => `/${def.endpoint}(${order.id})/${def.linesEndpoint}(${line.id})`;
   async function patchLine(order, line, body) {
     await co(lineUrl(order, line), { method: "PATCH", headers: { "If-Match": "*" }, body: JSON.stringify(body) });
@@ -798,17 +1021,14 @@ function buildOrder(key) {
     else {
       body = { lineType: "Item", lineObjectNumber: l.item };
       if (l.description) body.description = l.description;
-      if (l.qty !== "" && l.qty != null) body.quantity = Number(l.qty);
-      if (l.cost !== "" && l.cost != null) body[def.priceKey] = Number(l.cost);
-      if (l.locationCode) {
-        const loc = (await lookups.locations()).find(x => (x.code || "").toLowerCase() === l.locationCode.toLowerCase());
-        if (loc) body.locationId = loc.id; else ctx.warnings.push(`Location ${l.locationCode} not found`);
-      }
+      if (l.qty !== "") body.quantity = Number(l.qty);
+      if (l.cost !== "") body[def.priceKey] = Number(l.cost);
+      if (l.locationId) body.locationId = l.locationId;
     }
     const line = await co(`/${def.endpoint}(${order.id})/${def.linesEndpoint}`, { method: "POST", body: JSON.stringify(body) });
-    if (l.lineType === "Comment") return line;
+    if (l.lineType === "Comment") return;
 
-    // BC may overwrite description / cost from the item card - put ours back
+    // BC may overwrite description / price from the item card - put ours back
     const fix = {};
     if (body.description && line.description !== body.description) fix.description = body.description;
     if (body[def.priceKey] !== undefined && Math.abs(num(line[def.priceKey]) - body[def.priceKey]) > 1e-9) fix[def.priceKey] = body[def.priceKey];
@@ -816,89 +1036,54 @@ function buildOrder(key) {
 
     await setDims(order, line, l.dims, ctx);
 
-    if (l.vatBus) {
+    if (l.vat) {
       if (ctx.extOk) {
         try {
-          await bcFetch(`${extBase()}(${line.id})`, { method: "PATCH", headers: { "If-Match": "*" }, body: JSON.stringify({ vatBusPostingGroup: l.vatBus }) });
+          await bcFetch(`${extBase(key)}(${line.id})`, { method: "PATCH", headers: { "If-Match": "*" }, body: JSON.stringify({ vatBusPostingGroup: l.vat }) });
           ctx.vatSet++;
-        } catch (e) { ctx.vatPending++; ctx.warnings.push(`VAT group ${l.vatBus}: ${e.message}`); }
+        } catch (e) { ctx.vatPending++; ctx.warnings.push(`VAT group ${l.vat}: ${e.message}`); }
       } else ctx.vatPending++;
     }
-    return line;
   }
 
-  /* ---- save draft ---- */
-  form.addEventListener("submit", async ev => {
-    ev.preventDefault();
-    const errs = [];
-    if (!party.value) errs.push(`Choose a ${def.partyLabel.toLowerCase()}.`);
-    if (!blocks.length) errs.push("Add at least one line.");
-    blocks.forEach(b => { const e = b.validate(); if (e) errs.push(e); });
-    if (blocks.some(b => b.usesFx())) {
-      if (!(fx.rate() > 0)) errs.push("Enter the BNM rate.");
-      if (!fxDate.value) errs.push("Enter the BNM rate date.");
-    }
-    if (errs.length) { setStatus(errs.join(" "), "err"); return; }
-
-    btn.disabled = true; setStatus(`Checking ${def.partyLabel.toLowerCase()} and part numbers...`);
-    let partyRec;
-    try {
-      partyRec = (await lookups[def.partyLookup]()).find(r => (r.number || "").toLowerCase() === party.value.toLowerCase());
-      if (!partyRec) throw new Error(`${def.partyLabel} "${party.value}" not found. Pick one from the search list.`);
-      const items = await lookups.items();
-      const missing = [...new Set(blocks.flatMap(b => b.items()))].filter(n => !items.some(i => (i.number || "").toLowerCase() === n.toLowerCase()));
-      if (missing.length) throw new Error("Part no. not found: " + missing.join(", "));
-    } catch (e) { setStatus("Error: " + e.message, "err"); btn.disabled = false; return; }
-
-    const lines = blocks.flatMap(b => b.lines());
-    const header = { [def.partyKey]: partyRec.number };
-    if (date.value) header.orderDate = date.value;
-    if (ext && ext.value.trim()) header[def.extKey] = ext.value.trim();
-
-    const ctx = { warnings: [], vatSet: 0, vatPending: 0, extOk: isPO ? await lineExtAvailable() : false };
+  const saveBtn = h("button", { type: "button", onclick: save }, "Save to BC");
+  async function save() {
+    if (!plan) return;
+    saveBtn.disabled = true;
+    const ctx = { warnings: [], vatSet: 0, vatPending: 0, extOk: plan.extOk };
     let order = null, done = 0;
-    setStatus("Creating draft...");
+    const lines = plan.lines;
     try {
-      order = await co(`/${def.endpoint}`, { method: "POST", body: JSON.stringify(header) });
+      setStatus("Creating draft...");
+      order = await co(`/${def.endpoint}`, { method: "POST", body: JSON.stringify(plan.header) });
       for (const l of lines) {
         setStatus(`Creating ${order.number}: line ${done + 1} of ${lines.length}...`);
         await createLine(order, l, ctx);
         done++;
       }
-      const itemLines = lines.filter(l => l.lineType === "Item");
-      const noQty = itemLines.filter(l => !(Number(l.qty) > 0)).length;
       let msg = `Saved draft ${order.number} with ${done} line(s).`;
-      if (noQty) msg += ` ${noQty} line(s) have no quantity yet.`;
-      const noCost = itemLines.filter(l => l.cost === "" || l.cost == null).length;
-      if (noCost) msg += ` ${noCost} line(s) have no ${def.priceLabel.toLowerCase()} - BC used its default.`;
       if (ctx.vatSet) msg += ` VAT group set on ${ctx.vatSet} line(s).`;
       if (ctx.vatPending) msg += ` VAT group to set in BC on ${ctx.vatPending} line(s).`;
       const w = [...new Set(ctx.warnings)];
       if (w.length) msg += " Warnings: " + w.slice(0, 5).join("; ") + (w.length > 5 ? ` (+${w.length - 5} more)` : "");
       setStatus(msg, w.length || ctx.vatPending ? "warn" : "ok");
-      form.reset(); date.value = today; party.clear();
-      if (fxMid) fxMid.value = PRESET_CFG.fxMiddleRate || "1700";
-      resetBlocks();
+      plan = null; resetForm(); backToEdit();
       page = 0; refresh();
     } catch (e) {
       const extra = order ? ` (Draft ${order.number} was created with ${done} of ${lines.length} lines; open it in Business Central to fix or delete it.)` : "";
       setStatus("Error: " + e.message + extra, "err");
-      if (order) refresh();
-    } finally { btn.disabled = false; }
-  });
+      if (order) { plan = null; backToEdit(); refresh(); }
+    } finally { saveBtn.disabled = false; }
+  }
 
   /* ---- posting (switched off: CONFIG.features.posting) ---- */
   const qtyLines = o => (o[def.linesEndpoint] || []).filter(l => num(l.quantity) > 0);
   const toStep    = o => qtyLines(o).filter(l => num(l.quantity) > num(l[def.doneQtyKey]));
   const toInvoice = o => qtyLines(o).filter(l => num(l[def.doneQtyKey]) > num(l.invoicedQuantity));
-
   async function postStep(order, mode, button) {
     const isInv = mode === "invoice";
     const stepName = isInv ? "Invoice" : def.stepLabel;
-    const what = isInv
-      ? `Post the invoice for everything already ${def.stepPast} on ${order.number}?\n\nThis posts to the ledger (payables/receivables, tax) and cannot be undone from this portal.`
-      : `${def.stepLabel} ${order.number}?\n\nThis posts the ${def.stepVerb === "ship" ? "shipment" : "receipt"} (inventory moves) without invoicing.`;
-    if (!confirm(what)) return;
+    if (!confirm(isInv ? `Post the invoice for ${order.number}? This cannot be undone from this portal.` : `${def.stepLabel} ${order.number}?`)) return;
     button.disabled = true; setStatus(`${stepName}: preparing ${order.number}...`);
     try {
       for (const l of qtyLines(order)) {
@@ -907,29 +1092,16 @@ function buildOrder(key) {
         await patchLine(order, l, { [def.stepQtyKey]: isInv ? 0 : outstanding });
         await patchLine(order, l, { invoiceQuantity: isInv ? uninvoiced : 0 });
       }
-      setStatus(`${stepName}: posting ${order.number}...`);
-      await co(`/${def.endpoint}(${order.id})/Microsoft.NAV.${def.postAction}`,
-        { method: "POST", headers: { "If-Match": "*" }, body: "{}" });
+      await co(`/${def.endpoint}(${order.id})/Microsoft.NAV.${def.postAction}`, { method: "POST", headers: { "If-Match": "*" }, body: "{}" });
       setStatus(isInv ? `Invoice posted for ${order.number}.` : `${order.number} ${def.stepPast}.`, "ok");
-      refresh();
-      delete loaded.inventory;
-    } catch (e) {
-      setStatus(`Could not ${stepName.toLowerCase()} ${order.number}: ${e.message}`, "err");
-      button.disabled = false;
-      refresh();
-    }
+      refresh(); delete loaded.inventory;
+    } catch (e) { setStatus(`Could not ${stepName.toLowerCase()} ${order.number}: ${e.message}`, "err"); button.disabled = false; refresh(); }
   }
   function progressText(o) {
     const lines = qtyLines(o);
     if (!lines.length) return "No lines";
-    const q = lines.reduce((s, l) => s + num(l.quantity), 0);
-    const d = lines.reduce((s, l) => s + num(l[def.doneQtyKey]), 0);
-    const i = lines.reduce((s, l) => s + num(l.invoicedQuantity), 0);
-    const cap = def.stepPast[0].toUpperCase() + def.stepPast.slice(1);
-    const f = n => Number(n.toFixed(5)).toLocaleString();
-    return h("div", { class: "progress" },
-      h("div", { class: d >= q ? "done" : "" }, `${cap} ${f(d)} / ${f(q)}`),
-      h("div", { class: i >= q ? "done" : "" }, `Invoiced ${f(i)} / ${f(q)}`));
+    const q = lines.reduce((s, l) => s + num(l.quantity), 0), d = lines.reduce((s, l) => s + num(l[def.doneQtyKey]), 0), i = lines.reduce((s, l) => s + num(l.invoicedQuantity), 0);
+    return h("div", { class: "progress" }, h("div", {}, `${def.stepPast} ${fmtNum(d)} / ${fmtNum(q)}`), h("div", {}, `Invoiced ${fmtNum(i)} / ${fmtNum(q)}`));
   }
 
   /* ---- list with paging ---- */
@@ -939,14 +1111,13 @@ function buildOrder(key) {
   const nextBtn = h("button", { type: "button", class: "ghost small", onclick: () => { page++; refresh(); } }, "Next ›");
   const pageInfo = h("span", { class: "muted" });
   const pager = h("div", { class: "row-actions pager" }, prevBtn, pageInfo, nextBtn);
-  const extBadge = h("span", { class: "tag" }, isPO ? "Checking VAT extension..." : "");
-  if (!isPO) extBadge.classList.add("hidden");
+  const extBadge = h("span", { class: "tag" }, "Checking VAT extension...");
 
   async function vatMissingFor(rows) {
-    if (!isPO || !rows.length || !(await lineExtAvailable())) return null;
+    if (!rows.length || !(await lineExtAvailable(key))) return null;
     try {
       const filter = rows.map(r => `documentNo eq '${String(r.number).replace(/'/g, "''")}'`).join(" or ");
-      const d = await bcFetch(`${extBase()}?$filter=${encodeURIComponent(filter)}&$select=documentNo,no,type,vatBusPostingGroup`);
+      const d = await bcFetch(`${extBase(key)}?$filter=${encodeURIComponent(filter)}&$select=documentNo,no,type,vatBusPostingGroup`);
       const s = new Set();
       d.value.forEach(l => { if (l.type === "Item" && l.no && !l.vatBusPostingGroup) s.add(l.documentNo); });
       return s;
@@ -954,7 +1125,7 @@ function buildOrder(key) {
   }
 
   async function refresh() {
-    if (isPO) lineExtAvailable().then(ok => {
+    lineExtAvailable(key).then(ok => {
       extBadge.className = "tag " + (ok ? "ok" : "warn");
       extBadge.textContent = ok ? "VAT extension connected" : "VAT extension not found – VAT group to set in BC";
     });
@@ -965,17 +1136,14 @@ function buildOrder(key) {
       if (!data.value.length && page > 0) { page--; return refresh(); }
       const hasNext = data.value.length > PAGE_SIZE;
       const rows = data.value.slice(0, PAGE_SIZE);
-      const from = page * PAGE_SIZE + 1, to = page * PAGE_SIZE + rows.length;
-      pageInfo.textContent = rows.length ? `Page ${page + 1} · orders ${from}–${to}` : "";
-      prevBtn.disabled = page === 0;
-      nextBtn.disabled = !hasNext;
+      pageInfo.textContent = rows.length ? `Page ${page + 1} · orders ${page * PAGE_SIZE + 1}–${page * PAGE_SIZE + rows.length}` : "";
+      prevBtn.disabled = page === 0; nextBtn.disabled = !hasNext;
       const vatMissing = await vatMissingFor(rows);
       const nameKey = def.columns[2][0];
       const extra = [
         { label: "Lines", render: r => String((r[def.linesEndpoint] || []).filter(l => l.lineType === "Item").length) },
         { label: "Notes", render: r => {
-          const items = (r[def.linesEndpoint] || []).filter(l => l.lineType === "Item");
-          const noQty = items.filter(l => !(num(l.quantity) > 0)).length;
+          const noQty = (r[def.linesEndpoint] || []).filter(l => l.lineType === "Item" && !(num(l.quantity) > 0)).length;
           const tags = [];
           if (noQty) tags.push(h("span", { class: "tag warn" }, `${noQty} qty pending`));
           if (vatMissing && vatMissing.has(r.number)) tags.push(h("span", { class: "tag warn" }, "VAT group to set in BC"));
@@ -985,12 +1153,10 @@ function buildOrder(key) {
       if (CONFIG.features.posting) extra.push(
         { label: "Progress", render: r => progressText(r) },
         { label: "Action", render: r => {
-          if (r.status === "In Review") return h("button", { type: "button", class: "small", disabled: true }, "Awaiting approval");
-          const canStep = toStep(r).length > 0, canInv = toInvoice(r).length > 0;
           const stepBtn = h("button", { type: "button", class: "small" }, def.stepLabel);
-          const invBtn  = h("button", { type: "button", class: "small" }, canInv ? "Invoice" : "🔒 Invoice");
-          if (canStep) stepBtn.addEventListener("click", () => postStep(r, "step", stepBtn)); else stepBtn.disabled = true;
-          if (canInv)  invBtn.addEventListener("click",  () => postStep(r, "invoice", invBtn)); else invBtn.disabled = true;
+          const invBtn = h("button", { type: "button", class: "small" }, "Invoice");
+          if (toStep(r).length) stepBtn.addEventListener("click", () => postStep(r, "step", stepBtn)); else stepBtn.disabled = true;
+          if (toInvoice(r).length) invBtn.addEventListener("click", () => postStep(r, "invoice", invBtn)); else invBtn.disabled = true;
           return h("span", { class: "row-actions", style: "margin:0;flex-wrap:nowrap" }, stepBtn, invBtn);
         } });
       renderTable(listBox, def.columns, rows, extra, { cellClass: (r, k) => k === nameKey ? "wrap" : "" });
@@ -1002,11 +1168,13 @@ function buildOrder(key) {
     h("div", { class: "card" },
       h("div", { class: "card-head" }, h("h2", {}, "New draft " + def.title.replace(/s$/, "")), extBadge),
       form),
+    previewCard,
     h("div", { class: "card" }, h("h2", {}, "Latest " + def.title),
       h("div", { class: "row-actions" }, h("button", { type: "button", class: "ghost", onclick: () => { page = 0; refresh(); } }, "Refresh")),
       listBox, pager)
   );
 }
+
 
 /* ---------- approvals tab (switched off: CONFIG.features.approvals) ---------- */
 function approvalBase() {
@@ -1084,7 +1252,7 @@ function buildUI(activeId) {
 function prefetch() {
   // warm up the search lists in the background
   ["vendors", "items", "customers", "locations", "dimensions"].forEach(k => lookups[k]().catch(() => {}));
-  lineExtAvailable();
+  lineExtAvailable("po"); lineExtAvailable("so");
 }
 
 /* ---------- start-up after sign-in ---------- */

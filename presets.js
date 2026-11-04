@@ -1,88 +1,65 @@
 /* =====================================================================
-   PO PRESETS for the Business Central Portal
-   Keep this file next to index.html. Edit it when a new contract or
-   period starts - no change to index.html needed.
-
-   Each preset is one reusable item-line pattern:
-     id                  unique short id (no spaces)
-     name                what users see in the Preset dropdown
-     group               "MY" or "SG" - only shown for companies in that group
-     active              false = hidden (kept for reference)
-     item                default part no. ("" = user enters it)
-     description         description base; the period is added behind it,
-                         e.g. "... (TIGR) - JAN 26" or "... - JAN-JUN 26"
-     year                2-digit year used in the period text
-     from / to           default month range (JAN ... DEC)
-     style               "monthly" | "quarterly" | "single"
-     location            Location Code (APX01 / APX02 / IREC01)
-     vatBusPostingGroup  set through the Saxon Portal API extension
-     price               { currency: "USD" } -> user enters USD price on the PO;
-                                            unit cost = USD x BNM rate (+ FX comment line)
-                         { }                -> user enters the unit cost on the PO
-                         (no prices are stored in this file - it is publicly readable)
-     dimensions          dimension name or code -> value (merged with defaults)
+   PORTAL SETTINGS for the Business Central Portal
+   Keep this file next to index.html. Edit it here - no change to
+   index.html needed. NOTE: this file is publicly readable on GitHub,
+   so never put prices or other confidential data in it.
    ===================================================================== */
 window.PORTAL_PRESETS = {
 
-  // Which companies belong to which group (matched against the company name)
+  // Which entity a BC company belongs to (matched against the company name)
   companyGroups: [
     { group: "MY", match: "Sdn Bhd|\\bMY\\b" },
     { group: "SG", match: "Pte Ltd|\\bSG\\b" }
   ],
 
-  // Text at the end of the FX comment line
-  fxMiddleRate: "1700",
+  // Registry dropdown (same order as your registry list)
+  registries: ["I-REC", "TIGR", "I-REC/TIGR", "GEC", "Rehash", "JEPX", "BCX", "LGC",
+               "T-REC", "K-REC", "AIB GO", "REGO", "NAR/MRET", "NAR", "MRET"],
 
-  // Applied to every preset unless the preset overrides it
-  defaults: {
-    dimensions: { "Cost center": "Z_NA", "Business line": "Z_NA", "Sales owner": "Z_NA" }
+  // Location Code by registry and entity. Leave "" until the code is known
+  // (the user can still type a location on the order).
+  locations: {
+    "I-REC":      { MY: "IREC01", SG: "IREC02" },
+    "TIGR":       { MY: "APX01",  SG: "APX02" },
+    "I-REC/TIGR": { MY: "", SG: "" },
+    "GEC":        { MY: "", SG: "" },
+    "Rehash":     { MY: "", SG: "" },
+    "JEPX":       { MY: "", SG: "" },
+    "BCX":        { MY: "", SG: "" },
+    "LGC":        { MY: "", SG: "" },
+    "T-REC":      { MY: "", SG: "" },
+    "K-REC":      { MY: "", SG: "" },
+    "AIB GO":     { MY: "", SG: "" },
+    "REGO":       { MY: "", SG: "" },
+    "NAR/MRET":   { MY: "", SG: "" },
+    "NAR":        { MY: "", SG: "" },
+    "MRET":       { MY: "", SG: "" }
   },
 
-  presets: [
-    /* ---------- MALAYSIA (Saxon Renewable Energy Sdn Bhd) ---------- */
-    { id: "my-tigr-v26-h1", name: "MY Solar TIGR V26 - JAN-JUN", group: "MY",
-      item: "", description: "MALAYSIA SOLAR RECS V26 (TIGR)", year: 26, from: "JAN", to: "JUN", style: "monthly",
-      location: "APX01", vatBusPostingGroup: "LOCAL", price: { currency: "USD" } },
+  // VAT Bus. Posting Group choices (one per order; each line can be changed)
+  vatGroups: {
+    po: ["LOCAL", "EXPORT", "PURCH-ZP", "PURCH-TX"],
+    so: ["LOCAL", "EXPORT", "SALES-SR", "SALES-ZR"]
+  },
 
-    { id: "my-tigr-v26-h2", name: "MY Solar TIGR V26 - JUL-DEC", group: "MY",
-      item: "0459EDR_MYSLR_V26", description: "MALAYSIA SOLAR RECS V26 (TIGR)", year: 26, from: "JUL", to: "DEC", style: "monthly",
-      location: "APX01", vatBusPostingGroup: "LOCAL", price: { currency: "USD" } },
+  // Dimensions set on every item line (dimension name or code -> value)
+  dimensions: { "Cost center": "Z_NA", "Business line": "Z_NA", "Sales owner": "Z_NA" },
 
-    { id: "my-bgs-v26-monthly", name: "MY Biogas IREC V26 - monthly", group: "MY",
-      item: "I0029_MYBGS_V26", description: "MALAYSIA BIOGAS RECS V26 (IREC)", year: 26, from: "JAN", to: "JUN", style: "monthly",
-      location: "IREC01", vatBusPostingGroup: "LOCAL", price: { currency: "USD" } },
-
-    { id: "my-bgs-v26-single", name: "MY Biogas IREC V26 - JAN-JUN one line", group: "MY",
-      item: "I0033_MYBGS_V26", description: "MALAYSIA BIOGAS RECS V26 (IREC)", year: 26, from: "JAN", to: "JUN", style: "single",
-      location: "IREC01", vatBusPostingGroup: "LOCAL", price: { currency: "USD" } },
-
-    { id: "my-bgs-v25-monthly", name: "MY Biogas IREC V25 - JUL-DEC", group: "MY", active: false,
-      item: "I0032_MYBGS_V25", description: "MALAYSIA BIOGAS RECS V25 (IREC)", year: 25, from: "JUL", to: "DEC", style: "monthly",
-      location: "IREC01", vatBusPostingGroup: "LOCAL", price: { currency: "USD" } },
-
-    /* ---------- SINGAPORE (Saxon Renewables Pte Ltd) ---------- */
-    { id: "sg-resi-v26-single", name: "SG Resi TIGR V26 - JAN-JUN one line", group: "SG",
-      item: "T3156_SGSLR_V26", description: "SINGAPORE SOLAR RECS V26 (TIGR)", year: 26, from: "JAN", to: "JUN", style: "single",
-      location: "APX02", vatBusPostingGroup: "PURCH-ZP", price: {} },
-
-    { id: "sg-resi-v26-monthly", name: "SG Resi TIGR V26 - monthly", group: "SG",
-      item: "T3300_SGSLR_V26", description: "SINGAPORE SOLAR RECS V26 (TIGR)", year: 26, from: "JAN", to: "JUN", style: "monthly",
-      location: "APX02", vatBusPostingGroup: "PURCH-ZP", price: {} },
-
-    { id: "sg-com-v26-monthly", name: "SG Com TIGR V26 - monthly", group: "SG",
-      item: "T5383_SGSLR_V26", description: "SINGAPORE SOLAR RECS V26 (TIGR)", year: 26, from: "JAN", to: "DEC", style: "monthly",
-      location: "APX02", vatBusPostingGroup: "PURCH-TX", price: {} },
-
-    { id: "sg-com-v26-quarterly", name: "SG Com TIGR V26 - quarterly", group: "SG",
-      item: "T5508_SGSLR_V26", description: "SINGAPORE SOLAR RECS V26 (TIGR)", year: 26, from: "JAN", to: "SEP", style: "quarterly",
-      location: "APX02", vatBusPostingGroup: "PURCH-TX", price: {} },
-
-    { id: "sg-com-v25-monthly", name: "SG Com TIGR V25 - monthly", group: "SG", active: false,
-      item: "T5382_SGSLR_V25", description: "SINGAPORE SOLAR RECS V25 (TIGR)", year: 25, from: "JUL", to: "DEC", style: "monthly",
-      location: "APX02", vatBusPostingGroup: "PURCH-TX", price: {} },
-
-    { id: "sg-com-v25-quarterly", name: "SG Com TIGR V25 - quarterly", group: "SG", active: false,
-      item: "T5508_SGSLR_V25", description: "SINGAPORE SOLAR RECS V25 (TIGR)", year: 25, from: "JUL", to: "DEC", style: "quarterly",
-      location: "APX02", vatBusPostingGroup: "PURCH-TX", price: {} }
+  /* Comment templates. Gaps are written as {type:Label} or {type:Label=default}
+     types: text, number, percent (adds %), date (1 JAN 2026),
+            longdate (30 SEPTEMBER 2026), registry (dropdown), free (any text)
+     hint "fx" shows price x rate under the comment. */
+  comments: [
+    { label: "FX rate", hint: "fx",
+      text: "{text:Currency=USD} {number:Price} @ BNM RATE {number:BNM rate} ON {longdate:Rate date} AT MIDDLE RATE 1700" },
+    { label: "Issuance fee",              text: "ISSUANCE FEE: USD {number:Fee}" },
+    { label: "Redemption & issuance fee", text: "REDEMPTION & ISSUANCE FEE: USD {number:Fee}" },
+    { label: "Buyer's profit sharing",    text: "BUYER'S PROFIT SHARING PERCENTAGE {percent:Percentage}" },
+    { label: "Agreement dated",           text: "AGREEMENT DATED {date:Date}" },
+    { label: "Purchase order dated",      text: "PURCHASE ORDER DATED {date:Date}" },
+    { label: "Trade confirmation dated",  text: "TRADE CONFIRMATION DATED {date:Date}" },
+    { label: "Transfer of RECs",          text: "TRANSFER OF RECS ({registry:Registry})" },
+    { label: "Redemption of RECs",        text: "REDEMPTION OF RECS ({registry:Registry})" },
+    { label: "Free text",                 text: "{free:Text}" }
   ]
 };
