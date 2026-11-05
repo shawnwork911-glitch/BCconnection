@@ -124,7 +124,7 @@ const CONFIG = {
   // Saxon Portal API extension (sets VAT Bus. Posting Group on PO lines).
   // Leave publisher blank to switch it off.
   lineExtApi: { publisher: "saxon", group: "portal", version: "v1.0",
-                entities: { po: "purchaseLineExts", so: "salesLineExts" } },
+                entities: { po: "purchaseLineExts", so: "salesLineExts", customers: "customerExts" } },
 
   // Approvals need their own custom API page (only used if features.approvals = true).
   approvalApi: {
@@ -402,8 +402,7 @@ const MASTER = {
   customers: {
     title: "Customers", singular: "customer", endpoint: "customers",
     fields: [
-      { key: "number", label: "Customer ID", kind: "noSeries" },
-      { key: "displayName", label: "Name", required: true, upper: true },
+      { key: "displayName", label: "Customer name", required: true, upper: true },
       { key: "email", label: "Email (separate several with ;)", kind: "emails" },
       { key: "phoneNumber", label: "Phone" },
       { key: "addressLine1", label: "Address", upper: true },
@@ -411,8 +410,14 @@ const MASTER = {
       { key: "city", label: "City", upper: true },
       { key: "postalCode", label: "Postal code", upper: true },
       { key: "country", label: "Country code (e.g. MY)", upper: true },
-      { key: "paymentTerms", label: "Payment Terms Code", kind: "paymentTerms" }
+      { key: "paymentTerms", label: "Payment Terms Code", kind: "paymentTerms" },
+      { key: "genBusPostingGroup", label: "Gen. Bus. Posting Group", required: true, ext: true, optionsFrom: "genBusPostingGroups" },
+      { key: "customerPostingGroup", label: "Customer Posting Group", required: true, ext: true, optionsFrom: "customerPostingGroups" },
+      { key: "taxIdentificationNo", label: "Tax Identification No. (TIN)", ext: true, upper: true },
+      { key: "idType", label: "ID Type", ext: true, optionsFrom: "idTypes" },
+      { key: "idNo", label: "ID No.", ext: true, upper: true }
     ],
+    noteAuto: "Customer ID is given automatically by BC.",
     columns: [["number","Customer ID"],["displayName","Name"],["email","Email"],["phoneNumber","Phone"],["city","City"]]
   }
 };
@@ -503,6 +508,13 @@ function buildMaster(key) {
       controls[f.key] = { get: () => input.value, reset() { input.value = ""; } };
       return h("label", {}, f.label, input);
     }
+    if (f.optionsFrom) {
+      const opts = ((SETTINGS.customerSetup || {})[f.optionsFrom]) || [];
+      input = h("select", { required: !!f.required }, h("option", { value: "" }, f.required ? "(choose)" : "(none)"),
+        opts.map(o => h("option", { value: o.code }, o.desc && o.desc !== o.code ? `${o.code} – ${o.desc}` : o.code)));
+      controls[f.key] = { get: () => input.value, reset() { input.value = ""; } };
+      return h("label", {}, f.label + (f.required ? " *" : ""), input);
+    }
     if (f.options) input = h("select", {}, h("option", { value: "" }, "(default)"), f.options.map(o => h("option", { value: o }, o)));
     else input = h("input", { type: f.type === "number" ? "number" : "text", required: !!f.required, value: def0,
                               step: f.type === "number" ? "any" : undefined, class: f.upper ? "upper" : undefined,
@@ -517,7 +529,7 @@ function buildMaster(key) {
 
   /* read + check the form; nothing is sent to BC here */
   async function collect() {
-    const body = {}, shown = [];
+    const body = {}, extBody = {}, shown = [];
     let series = null;
     for (const f of def.fields) {
       const v = controls[f.key].get();
@@ -527,7 +539,15 @@ function buildMaster(key) {
         else shown.push([f.label, "(BC default)"]);
         continue;
       }
-      if (v === "") { shown.push([f.label, ""]); continue; }
+      if (v === "") {
+        if (f.required) throw new Error(`Please fill in ${f.label}.`);
+        shown.push([f.label, ""]); continue;
+      }
+      if (f.ext) {
+        extBody[f.key] = f.upper ? v.toUpperCase() : v;
+        const o = (((SETTINGS.customerSetup || {})[f.optionsFrom]) || []).find(x => x.code === v);
+        shown.push([f.label, o && o.desc && o.desc !== o.code ? `${v} – ${o.desc}` : extBody[f.key]]); continue;
+      }
       if (f.kind === "paymentTerms") {
         const pt = (await paymentTermsLookup()).find(x => String(x.code).toUpperCase() === v.toUpperCase());
         if (!pt) throw new Error(`Payment terms ${v} does not exist in this company in BC.`);
@@ -553,7 +573,10 @@ function buildMaster(key) {
       const same = existing.filter(r => body.displayName && normName(r.displayName) === normName(body.displayName));
       if (same.length) warnings.push(`A ${def.singular} with the same name already exists: ${same.map(r => r.number).join(", ")}`);
     } catch (e) { if (/already exists/.test(e.message)) throw e; }
-    return { body, series, shown, warnings };
+    if (Object.keys(extBody).length && !(await lineExtAvailable(key)))
+      warnings.push("The Saxon Portal API extension v1.3 is not installed yet, so posting groups and MyInvois fields will NOT be set – you would need to fill them in BC.");
+    if (def.noteAuto) shown.unshift([def.fields[0].key === "displayName" ? "Customer ID" : "ID", "(given automatically by BC)"]);
+    return { body, extBody, series, shown, warnings };
   }
 
   function showPreview(p) {
@@ -592,7 +615,18 @@ function buildMaster(key) {
       const body = { ...pending.body };
       if (pending.series) { setStatus(`Taking the next number from ${pending.series}...`); body.number = await nextNumberFrom(pending.series); }
       const rec = await co(`/${def.endpoint}`, { method: "POST", body: JSON.stringify(body) });
-      setStatus(`Created ${def.singular} ${rec.number} - ${rec.displayName}`, "ok");
+      let extNote = "", kind = "ok";
+      if (Object.keys(pending.extBody || {}).length) {
+        setStatus(`Created ${rec.number}. Setting posting groups and MyInvois fields...`);
+        try {
+          await bcFetch(`${extBase(key)}(${rec.id})`, { method: "PATCH", headers: { "If-Match": "*" }, body: JSON.stringify(pending.extBody) });
+          extNote = " Posting groups and MyInvois fields set.";
+        } catch (e) {
+          extNote = ` BUT posting groups / MyInvois fields were not set (${e.message}) – please fill them in on the customer card in BC.`;
+          kind = "warn";
+        }
+      }
+      setStatus(`Created ${def.singular} ${rec.number} - ${rec.displayName}.` + extNote, kind);
       Object.values(controls).forEach(c => c.reset());
       pending = null; backToEdit();
       clearCache(def.endpoint);
@@ -611,7 +645,8 @@ function buildMaster(key) {
   refreshers[key] = refresh;
 
   return h("div", {},
-    h("div", { class: "card" }, h("h2", {}, "Create " + def.singular), form),
+    h("div", { class: "card" }, h("h2", {}, "Create " + def.singular),
+      def.noteAuto ? h("p", { class: "muted small", style: "margin-top:-.4rem" }, def.noteAuto) : "", form),
     previewCard,
     h("div", { class: "card" }, h("h2", {}, "Latest " + def.title),
       h("div", { class: "row-actions" }, h("button", { type: "button", class: "ghost", onclick: refresh }, "Refresh")),

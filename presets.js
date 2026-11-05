@@ -61,6 +61,19 @@ window.PORTAL_PRESETS = {
     customers: []
   },
 
+  // Dropdowns for new customers (posting groups + MyInvois). Needs Saxon Portal API v1.3.
+  customerSetup: {
+    genBusPostingGroups: [
+      { code: "INTERCO", desc: "INTERCO" }, { code: "LOCAL", desc: "LOCAL" },
+      { code: "OVERSEAS", desc: "OVERSEAS" }, { code: "RELATED", desc: "RELATED" } ],
+    customerPostingGroups: [
+      { code: "IC-NT-SAXONSG", desc: "Interco Non-Trade Receivables - Saxon Renewables Pte Ltd" },
+      { code: "IC-T-SAXONSG",  desc: "Interco Trade Receivables - Saxon Renewables Pte Ltd" },
+      { code: "NON-TRADE",     desc: "Non-Trade Receivables" },
+      { code: "TRADE",         desc: "Trade Receivables" } ],
+    idTypes: [ { code: "NRIC" }, { code: "PASSPORT" }, { code: "BRN" }, { code: "Army" } ]
+  },
+
   // Defaults for new part numbers (Costs & Posting)
   itemDefaults: { generalProductPostingGroupCode: "RECS", inventoryPostingGroupCode: "RECS" },
 
