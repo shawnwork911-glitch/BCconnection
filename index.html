@@ -79,6 +79,7 @@
   tr.comment td { color:var(--muted); font-style:italic; background:#fafbfc; }
   table.lines select.vat { margin:0; padding:.35rem; }
   tfoot td { border-bottom:none; }
+  input.upper { text-transform:uppercase; }
   .fx-item { margin-top:.6rem; padding:.5rem .6rem; background:#f7f9fb; border:1px dashed var(--line); border-radius:6px; }
   input:disabled { background:#eef1f4; color:var(--muted); }
 </style>
@@ -374,37 +375,43 @@ const MASTER = {
       { key: "number", label: "Part no. (blank = auto)" },
       { key: "displayName", label: "Description", required: true },
       { key: "type", label: "Type", options: ["Inventory", "Service", "Non-Inventory"] },
-      { key: "baseUnitOfMeasureCode", label: "Unit of measure (e.g. PCS)" },
+      { key: "baseUnitOfMeasureCode", label: "Unit of measure (e.g. RECS)" },
       { key: "unitPrice", label: "Unit price", type: "number" },
-      { key: "unitCost", label: "Unit cost", type: "number" }
+      { key: "unitCost", label: "Unit cost", type: "number" },
+      { key: "generalProductPostingGroupCode", label: "Gen. Prod. Posting Group", defaultFrom: "itemDefaults", upper: true },
+      { key: "inventoryPostingGroupCode", label: "Inventory Posting Group", defaultFrom: "itemDefaults", upper: true }
     ],
-    columns: [["number","Part no."],["displayName","Description"],["type","Type"],["baseUnitOfMeasureCode","UoM"],["unitPrice","Unit price"],["inventory","Inventory"]]
+    columns: [["number","Part no."],["displayName","Description"],["type","Type"],["baseUnitOfMeasureCode","UoM"],["generalProductPostingGroupCode","Gen. Prod."],["inventoryPostingGroupCode","Inv. Posting"],["inventory","Inventory"]]
   },
   vendors: {
     title: "Suppliers (Vendors)", singular: "supplier", endpoint: "vendors",
     fields: [
-      { key: "number", label: "Supplier ID (blank = auto)" },
-      { key: "displayName", label: "Name", required: true },
-      { key: "email", label: "Email", type: "email" },
+      { key: "number", label: "Supplier ID", kind: "noSeries" },
+      { key: "displayName", label: "Name", required: true, upper: true },
+      { key: "email", label: "Email (separate several with ;)", kind: "emails" },
       { key: "phoneNumber", label: "Phone" },
-      { key: "addressLine1", label: "Address" },
-      { key: "city", label: "City" },
-      { key: "postalCode", label: "Postal code" },
-      { key: "country", label: "Country code (e.g. MY)" }
+      { key: "addressLine1", label: "Address", upper: true },
+      { key: "addressLine2", label: "Address 2", upper: true },
+      { key: "city", label: "City", upper: true },
+      { key: "postalCode", label: "Postal code", upper: true },
+      { key: "country", label: "Country code (e.g. MY)", upper: true },
+      { key: "paymentTerms", label: "Payment Terms Code", kind: "paymentTerms" }
     ],
     columns: [["number","Supplier ID"],["displayName","Name"],["email","Email"],["phoneNumber","Phone"],["city","City"]]
   },
   customers: {
     title: "Customers", singular: "customer", endpoint: "customers",
     fields: [
-      { key: "number", label: "Customer ID (blank = auto)" },
-      { key: "displayName", label: "Name", required: true },
-      { key: "email", label: "Email", type: "email" },
+      { key: "number", label: "Customer ID", kind: "noSeries" },
+      { key: "displayName", label: "Name", required: true, upper: true },
+      { key: "email", label: "Email (separate several with ;)", kind: "emails" },
       { key: "phoneNumber", label: "Phone" },
-      { key: "addressLine1", label: "Address" },
-      { key: "city", label: "City" },
-      { key: "postalCode", label: "Postal code" },
-      { key: "country", label: "Country code (e.g. MY)" }
+      { key: "addressLine1", label: "Address", upper: true },
+      { key: "addressLine2", label: "Address 2", upper: true },
+      { key: "city", label: "City", upper: true },
+      { key: "postalCode", label: "Postal code", upper: true },
+      { key: "country", label: "Country code (e.g. MY)", upper: true },
+      { key: "paymentTerms", label: "Payment Terms Code", kind: "paymentTerms" }
     ],
     columns: [["number","Customer ID"],["displayName","Name"],["email","Email"],["phoneNumber","Phone"],["city","City"]]
   }
@@ -447,14 +454,60 @@ const TABS = [
 const refreshers = {};   // tab id -> function that reloads its list
 
 /* ---------- master data tab ---------- */
+/* next number from a BC number series (Saxon Portal API v1.2) */
+async function nextNumberFrom(seriesCode) {
+  const a = CONFIG.lineExtApi;
+  const url = `${BC_ROOT}/${a.publisher}/${a.group}/${a.version}/companies(${companyId})/nextNumbers`;
+  try {
+    const r = await bcFetch(url, { method: "POST", body: JSON.stringify({ seriesCode }) });
+    if (!r || !r.number) throw new Error("BC returned no number");
+    return r.number;
+  } catch (e) {
+    if (/404|not found|No HTTP resource|BadRequest_NotFound/i.test(e.message))
+      throw new Error(`Could not take a number from ${seriesCode}: the Saxon Portal API extension v1.2 is not installed yet. Choose "Type the ID myself" for now.`);
+    throw new Error(`Could not take a number from ${seriesCode}: ${e.message}`);
+  }
+}
+const paymentTermsLookup = () => cached("paymentTerms", () => coAll("/paymentTerms?$select=id,code,displayName"));
+
 function buildMaster(key) {
   const def = MASTER[key];
   const listBox = h("div", { class: "tablewrap" });
+  const controls = {};   // key -> { get(), reset() }
 
   const fieldEls = def.fields.map(f => {
-    const input = f.options
-      ? h("select", { name: f.key }, h("option", { value: "" }, "(default)"), f.options.map(o => h("option", { value: o }, o)))
-      : h("input", { name: f.key, type: f.type || "text", required: !!f.required, step: f.type === "number" ? "any" : undefined });
+    const def0 = f.defaultFrom ? ((SETTINGS[f.defaultFrom] || {})[f.key] || "") : "";
+    let input, wrap;
+    if (f.kind === "noSeries") {
+      const series = ((SETTINGS.noSeries || {})[key]) || [];
+      const manual = h("input", { placeholder: series.length ? "Type the ID" : "blank = BC default", style: series.length ? "display:none" : "", class: "upper" });
+      if (series.length) {
+        const sel = h("select", {},
+          series.map(s => h("option", { value: s.code }, `${s.code} – ${s.desc}`)),
+          h("option", { value: "" }, "Type the ID myself"));
+        sel.value = series[series.length > 1 ? 1 : 0].code;
+        sel.addEventListener("change", () => { manual.style.display = sel.value ? "none" : ""; if (!sel.value) manual.focus(); });
+        wrap = h("div", {}, sel, manual);
+        controls[f.key] = { get: () => sel.value ? { series: sel.value } : { value: manual.value.trim().toUpperCase() },
+                            reset() { sel.value = series[series.length > 1 ? 1 : 0].code; manual.value = ""; manual.style.display = "none"; } };
+      } else {
+        wrap = manual;
+        controls[f.key] = { get: () => ({ value: manual.value.trim().toUpperCase() }), reset() { manual.value = ""; } };
+      }
+      return h("label", {}, f.label, wrap);
+    }
+    if (f.kind === "paymentTerms") {
+      input = h("select", {}, h("option", { value: "" }, "(none)"),
+        (SETTINGS.paymentTerms || []).map(g => h("optgroup", { label: g.group },
+          g.terms.map(t => h("option", { value: t.code }, `${t.code} – ${t.desc}`)))));
+      controls[f.key] = { get: () => input.value, reset() { input.value = ""; } };
+      return h("label", {}, f.label, input);
+    }
+    if (f.options) input = h("select", {}, h("option", { value: "" }, "(default)"), f.options.map(o => h("option", { value: o }, o)));
+    else input = h("input", { type: f.type === "number" ? "number" : "text", required: !!f.required, value: def0,
+                              step: f.type === "number" ? "any" : undefined, class: f.upper ? "upper" : undefined,
+                              maxlength: f.kind === "emails" ? "80" : undefined });
+    controls[f.key] = { get: () => input.value.trim(), reset() { input.value = def0; } };
     return h("label", {}, f.label, input);
   });
   const btn = h("button", { type: "submit" }, "Create " + def.singular);
@@ -462,17 +515,30 @@ function buildMaster(key) {
 
   form.addEventListener("submit", async ev => {
     ev.preventDefault();
-    const body = {};
-    def.fields.forEach(f => {
-      let v = form.elements[f.key].value.trim();
-      if (v === "") return;
-      body[f.key] = f.type === "number" ? Number(v) : v;
-    });
     btn.disabled = true; setStatus("Creating " + def.singular + "...");
     try {
+      const body = {};
+      let series = null;
+      for (const f of def.fields) {
+        const v = controls[f.key].get();
+        if (f.kind === "noSeries") { if (v.series) series = v.series; else if (v.value) body.number = v.value; continue; }
+        if (v === "") continue;
+        if (f.kind === "paymentTerms") {
+          const pt = (await paymentTermsLookup()).find(x => String(x.code).toUpperCase() === v.toUpperCase());
+          if (!pt) throw new Error(`Payment terms ${v} does not exist in this company in BC.`);
+          body.paymentTermsId = pt.id; continue;
+        }
+        if (f.kind === "emails") {
+          const bad = v.split(";").map(x => x.trim()).filter(Boolean).filter(x => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(x));
+          if (bad.length) throw new Error("Email not valid: " + bad.join(", "));
+          body.email = v.split(";").map(x => x.trim()).filter(Boolean).join(";"); continue;
+        }
+        body[f.key] = f.type === "number" ? Number(v) : (f.upper ? v.toUpperCase() : v);
+      }
+      if (series) { setStatus(`Taking the next number from ${series}...`); body.number = await nextNumberFrom(series); }
       const rec = await co(`/${def.endpoint}`, { method: "POST", body: JSON.stringify(body) });
       setStatus(`Created ${def.singular} ${rec.number} - ${rec.displayName}`, "ok");
-      form.reset();
+      Object.values(controls).forEach(c => c.reset());
       clearCache(def.endpoint);
       refresh();
     } catch (e) { setStatus("Error: " + e.message, "err"); }
