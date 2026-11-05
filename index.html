@@ -660,6 +660,29 @@ function makeCommentRow(onRemove, onMove) {
   return row;
 }
 
+/* a list of comment rows with its own "+ Add comment" button (used per item and at the bottom) */
+function makeCommentList(buttonText) {
+  const rows = [], box = h("div", {});
+  function add() {
+    const row = makeCommentRow(
+      r => { rows.splice(rows.indexOf(r), 1); r.box.remove(); },
+      (r, dir) => {
+        const i = rows.indexOf(r), j = i + dir;
+        if (j < 0 || j >= rows.length) return;
+        [rows[i], rows[j]] = [rows[j], rows[i]];
+        box.replaceChildren(...rows.map(c => c.box));
+      });
+    rows.push(row); box.append(row.box);
+  }
+  return {
+    box, add,
+    btn: h("button", { type: "button", class: "ghost small", onclick: add }, buttonText),
+    validate: () => rows.map(r => r.validate()).filter(Boolean),
+    lines: () => rows.map(r => ({ lineType: "Comment", description: r.text() })),
+    clear() { rows.length = 0; box.replaceChildren(); }
+  };
+}
+
 /* ---------- order tab (PO / SO) ---------- */
 function buildOrder(key) {
   const def = ORDERS[key];
@@ -711,6 +734,7 @@ function buildOrder(key) {
   const lastFx = { cur: "USD", rate: "", date: "" };   // new items reuse the last BNM rate / date
   function addPoBlock() {
     const blk = { box: h("div", { class: "block" }) };
+    const itemComments = makeCommentList("+ Add comment under this item");
     const st = { yy: new Date().getFullYear() % 100, from: 0, to: 11, style: "none", unticked: new Set(), over: {} };
     const item = searchBox({ placeholder: "Search part no. or description", source: lookups.items, extra: r => r.baseUnitOfMeasureCode,
       onPick: r => { if (r) applyItem(r); } });
@@ -826,7 +850,10 @@ function buildOrder(key) {
         h("label", {}, def.priceLabel, cost)),
       fxSection,
       periodWrap,
-      h("div", { style: "margin-top:.5rem" }, preview));
+      h("div", { style: "margin-top:.5rem" }, preview),
+      h("div", { class: "sub" }, "Comments under this item"),
+      itemComments.box,
+      itemComments.btn);
     redraw();
 
     blk.refresh = drawPreview;
@@ -841,6 +868,8 @@ function buildOrder(key) {
         if (!(Number(fxPrice.value) > 0) || !(Number(fxRate.value) > 0) || !fxDate.value) return `${item.value}: fill in currency price, BNM rate and rate date.`;
         if (!fxText.value.trim()) return `${item.value}: the FX comment is empty.`;
       }
+      const ce = itemComments.validate();
+      if (ce.length) return `${item.value}: ${ce[0]}`;
       return null;
     };
     blk.lines = () => {
@@ -851,6 +880,7 @@ function buildOrder(key) {
                  locationCode: rl.loc.value.trim(), vat: o.vat || orderVat.value, dims: DIMENSIONS };
       });
       if (fxAllowed && fxChk.checked) out.push({ lineType: "Comment", description: fxText.value.trim() });
+      out.push(...itemComments.lines());
       return out;
     };
     blocks.push(blk); blocksBox.append(blk.box);
@@ -859,6 +889,7 @@ function buildOrder(key) {
   /* SO line: find the part no. directly, or from an ID (last 4-5 digits + year) */
   function addSoLine(pre) {
     const blk = { box: h("div", { class: "block" }) };
+    const itemComments = makeCommentList("+ Add comment under this line");
     const o = {};
     const item = searchBox({ placeholder: "Search part no. or description", source: lookups.items, extra: r => r.baseUnitOfMeasureCode,
       onPick: r => { if (r) applyItem(r); } });
@@ -908,7 +939,9 @@ function buildOrder(key) {
         h("label", {}, "Location", rl.loc),
         h("label", {}, "Quantity", qty),
         h("label", {}, def.priceLabel, price),
-        h("label", {}, "VAT group", vatBox)));
+        h("label", {}, "VAT group", vatBox)),
+      itemComments.box,
+      h("div", { style: "margin-top:.5rem" }, itemComments.btn));
     drawVat();
 
     blk.refresh = drawVat;
@@ -916,10 +949,13 @@ function buildOrder(key) {
     blk.validate = () => {
       if (!item.value) return "Every line needs a part no.";
       if (desc.value.trim().length > 100) return "Description too long (max 100).";
+      const ce = itemComments.validate();
+      if (ce.length) return `${item.value}: ${ce[0]}`;
       return null;
     };
     blk.lines = () => [{ lineType: "Item", item: item.value, description: desc.value.trim(), qty: qty.value.trim(), cost: price.value.trim(),
-                         locationCode: rl.loc.value.trim(), vat: o.vat || orderVat.value, dims: DIMENSIONS }];
+                         locationCode: rl.loc.value.trim(), vat: o.vat || orderVat.value, dims: DIMENSIONS },
+                       ...itemComments.lines()];
     blk.isEmpty = () => !item.value && !qty.value && !price.value;
     if (pre) {
       item.set(pre.rec.number); applyItem(pre.rec);
@@ -1018,25 +1054,13 @@ function buildOrder(key) {
       results);
   }
 
-  /* ---- comments ---- */
-  const comments = [];
-  const commentsBox = h("div", {});
-  function addComment() {
-    const row = makeCommentRow(
-      r => { comments.splice(comments.indexOf(r), 1); r.box.remove(); },
-      (r, dir) => {
-        const i = comments.indexOf(r), j = i + dir;
-        if (j < 0 || j >= comments.length) return;
-        [comments[i], comments[j]] = [comments[j], comments[i]];
-        commentsBox.replaceChildren(...comments.map(c => c.box));
-      });
-    comments.push(row); commentsBox.append(row.box);
-  }
+  /* ---- comments at the bottom of the order ---- */
+  const bottomComments = makeCommentList("+ Add comment");
 
   function resetForm() {
     form.reset(); date.value = today; party.clear(); orderVat.value = "";
     blocks.length = 0; blocksBox.replaceChildren(); addBlock();
-    comments.length = 0; commentsBox.replaceChildren();
+    bottomComments.clear();
   }
 
   const previewBtn = h("button", { type: "submit" }, "Preview");
@@ -1052,10 +1076,10 @@ function buildOrder(key) {
     blocksBox,
     h("div", { class: "row-actions", style: "margin-top:0" },
       h("button", { type: "button", class: "ghost", onclick: () => addBlock() }, isPO ? "+ Add item" : "+ Add line")),
-    h("h2", { style: "margin-top:1.2rem" }, "Comments (added at the bottom)"),
-    commentsBox,
+    h("h2", { style: "margin-top:1.2rem" }, "Comments at the bottom of the order"),
+    bottomComments.box,
     h("div", { class: "row-actions", style: "margin-top:0" },
-      h("button", { type: "button", class: "ghost", onclick: addComment }, "+ Add comment")),
+      bottomComments.btn),
     h("div", { class: "row-actions", style: "border-top:1px solid var(--line);padding-top:.75rem" }, previewBtn)
   );
   addBlock();
@@ -1070,7 +1094,7 @@ function buildOrder(key) {
     if (!orderVat.value) errs.push("Choose the VAT Bus. Posting Group for the order.");
     if (!blocks.length) errs.push("Add at least one line.");
     blocks.forEach(b => { const e = b.validate(); if (e) errs.push(e); });
-    comments.forEach(c => { const e = c.validate(); if (e) errs.push(e); });
+    errs.push(...bottomComments.validate());
     if (errs.length) throw new Error(errs.join(" "));
 
     const [parties, items, locations, extOk] = await Promise.all([
@@ -1078,6 +1102,8 @@ function buildOrder(key) {
     const partyRec = parties.find(r => (r.number || "").toLowerCase() === party.value.toLowerCase());
     if (!partyRec) throw new Error(`${def.partyLabel} "${party.value}" not found. Pick one from the search list.`);
     const itemMap = new Map(items.map(i => [String(i.number).toLowerCase(), i]));
+    let dims = { plan: [], problems: [] };
+    try { dims = await resolveDims(DIMENSIONS); } catch (e) { dims.problems.push("Dimensions: " + e.message); }
     const missing = [...new Set(blocks.flatMap(b => b.items()))].filter(n => !itemMap.has(n.toLowerCase()));
     if (missing.length) throw new Error("Part no. not found in BC: " + missing.join(", "));
 
@@ -1097,9 +1123,9 @@ function buildOrder(key) {
         if (it.blocked === true) flags.push("item blocked");
         return { ...l, item: it.number, uom: it.baseUnitOfMeasureCode || "", locationId, flags };
       }),
-      ...comments.map(c => ({ lineType: "Comment", description: c.text(), flags: [] }))
+      ...bottomComments.lines().map(c => ({ ...c, flags: [] }))
     ];
-    return { partyRec, extOk, lines,
+    return { partyRec, extOk, lines, dimPlan: dims.plan, dimProblems: dims.problems,
       header: { [def.partyKey]: partyRec.number, ...(date.value ? { orderDate: date.value } : {}),
                 ...(ext && ext.value.trim() ? { [def.extKey]: ext.value.trim() } : {}) } };
   }
@@ -1117,7 +1143,10 @@ function buildOrder(key) {
         h("div", {}, h("b", {}, `${p.partyRec.number} — ${p.partyRec.displayName || ""}`)),
         h("div", {}, `Company: ${companyName()} · Order date: ${date.value || "(today)"} · VAT group: ${orderVat.value}` +
           (ext && ext.value.trim() ? ` · ${def.extLabel.replace(/ \(optional\)/, "")}: ${ext.value.trim()}` : "")),
-        dimText ? h("div", { class: "muted" }, "Dimensions on item lines: " + dimText) : ""),
+        dimText ? h("div", { class: "muted" }, "Dimensions: " + [
+          ...Object.entries(SETTINGS.headerDimensionNames || {}).map(([k, n]) => `${n} ${(SETTINGS.headerDimensions || {})[k] || "-"} (header)`),
+          ...p.dimPlan.map(d => `${d.code} ${d.valueCode}`)].join(" · ")) : "",
+        ...p.dimProblems.map(x => h("div", {}, h("span", { class: "tag warn" }, "Dimension will not be set"), " ", x))),
       h("div", { class: "tablewrap" }, h("table", {},
         h("thead", {}, h("tr", {}, ["#", "Type", "No.", "Description", "Location", "Quantity", "UoM", def.priceLabel, "Line amount", "VAT group", "Check"].map(t => h("th", {}, t)))),
         h("tbody", {}, p.lines.map((l, i) => l.lineType === "Comment"
@@ -1145,7 +1174,8 @@ function buildOrder(key) {
     try {
       plan = await buildPlan();
       const flagged = plan.lines.filter(l => l.flags.length).length;
-      setStatus(flagged ? `Preview ready – ${flagged} line(s) have notes. Check them, then Save to BC or go back.` : "Preview ready. Check it, then Save to BC.", flagged ? "warn" : "ok");
+      const notes = [flagged ? `${flagged} line(s) have notes` : "", plan.dimProblems.length ? `${plan.dimProblems.length} dimension(s) can't be set` : ""].filter(Boolean).join(", ");
+      setStatus(notes ? `Preview ready – ${notes}. Check them, then Save to BC or go back.` : "Preview ready. Check it, then Save to BC.", notes ? "warn" : "ok");
       showPreview(plan);
     } catch (e) { setStatus("Error: " + e.message, "err"); }
     finally { previewBtn.disabled = false; }
@@ -1156,25 +1186,45 @@ function buildOrder(key) {
   async function patchLine(order, line, body) {
     await co(lineUrl(order, line), { method: "PATCH", headers: { "If-Match": "*" }, body: JSON.stringify(body) });
   }
-  async function setDims(order, line, dims, ctx) {
-    const wanted = Object.entries(dims || {});
-    if (!wanted.length) return;
-    let all, existing;
-    try {
-      all = await lookups.dimensions();
-      existing = (await co(lineUrl(order, line) + "/dimensionSetLines")).value;
-    } catch (e) { ctx.warnings.push("Dimensions: " + e.message); return; }
+  /* Work out, once per order, which BC dimension + value code to use for each wanted dimension.
+     A dimension is only used if it really has the wanted value (e.g. Z_NA). */
+  async function resolveDims(dims) {
+    const plan = [], problems = [];
+    const onHeader = Object.values(SETTINGS.headerDimensionNames || {}).map(normName);
+    const wanted = Object.entries(dims || {}).filter(([name]) => !onHeader.includes(normName(name)));
+    if (!wanted.length) return { plan, problems };
+    const all = await lookups.dimensions();
     for (const [name, val] of wanted) {
       const n = normName(name);
-      const d = all.find(x => normName(x.code) === n || normName(x.displayName) === n || normName(x.code) === n.replace(/code$/, ""));
-      if (!d) { ctx.warnings.push(`Dimension "${name}" not found in BC`); continue; }
+      let cands = all.filter(x => normName(x.code) === n || normName(x.displayName) === n || normName(x.code) === n.replace(/code$/, ""));
+      if (!cands.length) cands = all.filter(x => normName(x.code).includes(n) || normName(x.displayName).includes(n));
+      if (!cands.length) { problems.push(`Dimension "${name}" not found in BC`); continue; }
+      let hit = null; const seen = [];
+      for (const d of cands) {
+        const vals = await cached("dimvals:" + d.id, () => coAll(`/dimensions(${d.id})/dimensionValues?$select=code,displayName`)).catch(() => []);
+        const v = vals.find(x => normName(x.code) === normName(val));
+        if (v) { hit = { id: d.id, code: d.code, valueCode: v.code }; break; }
+        seen.push(`${d.code} (values: ${vals.slice(0, 6).map(x => x.code).join(", ") || "none"}${vals.length > 6 ? ", …" : ""})`);
+      }
+      if (hit) plan.push(hit);
+      else problems.push(`Dimension "${name}": value ${val} not found – checked ${seen.join("; ")}`);
+    }
+    return { plan, problems };
+  }
+  async function setDims(order, line, dimPlan, ctx) {
+    if (!dimPlan || !dimPlan.length) return;
+    let existing;
+    try { existing = (await co(lineUrl(order, line) + "/dimensionSetLines")).value; }
+    catch (e) { ctx.warnings.push("Dimensions: " + e.message); return; }
+    for (const d of dimPlan) {
       const ex = existing.find(x => x.id === d.id || x.code === d.code);
       try {
-        if (ex) { if (ex.valueCode !== val) await co(`${lineUrl(order, line)}/dimensionSetLines(${ex.id})`, { method: "PATCH", headers: { "If-Match": "*" }, body: JSON.stringify({ valueCode: val }) }); }
-        else await co(lineUrl(order, line) + "/dimensionSetLines", { method: "POST", body: JSON.stringify({ id: d.id, valueCode: val }) });
-      } catch (e) { ctx.warnings.push(`Dimension ${d.code} = ${val}: ${e.message}`); }
+        if (ex) { if (ex.valueCode !== d.valueCode) await co(`${lineUrl(order, line)}/dimensionSetLines(${ex.id})`, { method: "PATCH", headers: { "If-Match": "*" }, body: JSON.stringify({ valueCode: d.valueCode }) }); }
+        else await co(lineUrl(order, line) + "/dimensionSetLines", { method: "POST", body: JSON.stringify({ id: d.id, valueCode: d.valueCode }) });
+      } catch (e) { ctx.warnings.push(`Dimension ${d.code} = ${d.valueCode}: ${e.message}`); }
     }
   }
+
   async function createLine(order, l, ctx) {
     let body;
     if (l.lineType === "Comment") body = { lineType: "Comment", description: l.description };
@@ -1194,7 +1244,7 @@ function buildOrder(key) {
     if (body[def.priceKey] !== undefined && Math.abs(num(line[def.priceKey]) - body[def.priceKey]) > 1e-9) fix[def.priceKey] = body[def.priceKey];
     if (Object.keys(fix).length) { try { await patchLine(order, line, fix); } catch (e) { ctx.warnings.push(`${l.description || l.item}: ${e.message}`); } }
 
-    await setDims(order, line, l.dims, ctx);
+    await setDims(order, line, ctx.dimPlan, ctx);
 
     if (l.vat) {
       if (ctx.extOk) {
@@ -1210,12 +1260,19 @@ function buildOrder(key) {
   async function save() {
     if (!plan) return;
     saveBtn.disabled = true;
-    const ctx = { warnings: [], vatSet: 0, vatPending: 0, extOk: plan.extOk };
+    const ctx = { warnings: [...plan.dimProblems], vatSet: 0, vatPending: 0, extOk: plan.extOk, dimPlan: plan.dimPlan };
     let order = null, done = 0;
     const lines = plan.lines;
     try {
       setStatus("Creating draft...");
       order = await co(`/${def.endpoint}`, { method: "POST", body: JSON.stringify(plan.header) });
+      // global dimensions (Cost center / Business line) go on the header; the lines inherit them
+      const hd = SETTINGS.headerDimensions || {};
+      if (Object.keys(hd).length) {
+        setStatus(`Creating ${order.number}: setting header dimensions...`);
+        try { await co(`/${def.endpoint}(${order.id})`, { method: "PATCH", headers: { "If-Match": "*" }, body: JSON.stringify(hd) }); }
+        catch (e) { ctx.warnings.push("Header dimensions: " + e.message); }
+      }
       for (const l of lines) {
         setStatus(`Creating ${order.number}: line ${done + 1} of ${lines.length}...`);
         await createLine(order, l, ctx);

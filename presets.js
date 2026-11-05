@@ -42,7 +42,12 @@ window.PORTAL_PRESETS = {
     so: ["LOCAL", "EXPORT", "SALES-SR", "SALES-ZR"]
   },
 
-  // Dimensions set on every item line (dimension name or code -> value)
+  // Global dimensions 1 and 2 are set on the ORDER HEADER (the lines inherit them).
+  // BC rejects them when set line by line through the API.
+  headerDimensions:     { shortcutDimension1Code: "Z_NA", shortcutDimension2Code: "Z_NA" },
+  headerDimensionNames: { shortcutDimension1Code: "Cost center", shortcutDimension2Code: "Business line" },
+
+  // Other dimensions are set on every item line (dimension name or code -> value)
   dimensions: { "Cost center": "Z_NA", "Business line": "Z_NA", "Sales owner": "Z_NA" },
 
   /* Comment templates. Gaps are written as {type:Label} or {type:Label=default}
