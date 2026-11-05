@@ -510,40 +510,96 @@ function buildMaster(key) {
     controls[f.key] = { get: () => input.value.trim(), reset() { input.value = def0; } };
     return h("label", {}, f.label, input);
   });
-  const btn = h("button", { type: "submit" }, "Create " + def.singular);
+  const btn = h("button", { type: "submit" }, "Preview");
   const form = h("form", { class: "grid" }, fieldEls, btn);
+  const previewCard = h("div", { class: "card hidden preview" });
+  let pending = null;   // { body, series }
+
+  /* read + check the form; nothing is sent to BC here */
+  async function collect() {
+    const body = {}, shown = [];
+    let series = null;
+    for (const f of def.fields) {
+      const v = controls[f.key].get();
+      if (f.kind === "noSeries") {
+        if (v.series) { series = v.series; shown.push([f.label, `Next number from ${v.series} (taken when you click Create)`]); }
+        else if (v.value) { body.number = v.value; shown.push([f.label, v.value]); }
+        else shown.push([f.label, "(BC default)"]);
+        continue;
+      }
+      if (v === "") { shown.push([f.label, ""]); continue; }
+      if (f.kind === "paymentTerms") {
+        const pt = (await paymentTermsLookup()).find(x => String(x.code).toUpperCase() === v.toUpperCase());
+        if (!pt) throw new Error(`Payment terms ${v} does not exist in this company in BC.`);
+        body.paymentTermsId = pt.id;
+        const t = (SETTINGS.paymentTerms || []).flatMap(g => g.terms).find(x => x.code === v);
+        shown.push([f.label, t ? `${v} – ${t.desc}` : v]); continue;
+      }
+      if (f.kind === "emails") {
+        const list = v.split(";").map(x => x.trim()).filter(Boolean);
+        const bad = list.filter(x => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(x));
+        if (bad.length) throw new Error("Email not valid: " + bad.join(", "));
+        body.email = list.join(";"); shown.push([f.label, body.email]); continue;
+      }
+      body[f.key] = f.type === "number" ? Number(v) : (f.upper ? v.toUpperCase() : v);
+      shown.push([f.label, String(body[f.key])]);
+    }
+    // duplicate checks against what is already in BC
+    const warnings = [];
+    try {
+      const existing = await lookups[def.endpoint]();
+      if (body.number && existing.some(r => String(r.number).toUpperCase() === body.number.toUpperCase()))
+        throw new Error(`${def.fields[0].label} ${body.number} already exists in BC.`);
+      const same = existing.filter(r => body.displayName && normName(r.displayName) === normName(body.displayName));
+      if (same.length) warnings.push(`A ${def.singular} with the same name already exists: ${same.map(r => r.number).join(", ")}`);
+    } catch (e) { if (/already exists/.test(e.message)) throw e; }
+    return { body, series, shown, warnings };
+  }
+
+  function showPreview(p) {
+    previewCard.replaceChildren(
+      h("div", { class: "card-head" }, h("h2", {}, `Preview – new ${def.singular}`),
+        h("span", { class: "tag" }, "Nothing is written to BC until you click Create")),
+      h("div", { class: "muted small", style: "margin-bottom:.5rem" }, "Company: " + companyName()),
+      ...p.warnings.map(w => h("div", { style: "margin-bottom:.4rem" }, h("span", { class: "tag warn" }, "Check"), " ", w)),
+      h("div", { class: "tablewrap" }, h("table", {},
+        h("thead", {}, h("tr", {}, h("th", {}, "Field"), h("th", {}, "Value written to BC"))),
+        h("tbody", {}, p.shown.map(([k, v]) => h("tr", {}, h("td", {}, k),
+          h("td", { class: "wrap" }, v === "" ? h("span", { class: "muted" }, "(empty)") : v)))))),
+      h("div", { class: "row-actions" },
+        h("button", { type: "button", class: "ghost", onclick: backToEdit }, "← Back to edit"),
+        createBtn));
+    form.classList.add("hidden"); previewCard.classList.remove("hidden");
+  }
+  function backToEdit() { previewCard.classList.add("hidden"); form.classList.remove("hidden"); }
 
   form.addEventListener("submit", async ev => {
     ev.preventDefault();
-    btn.disabled = true; setStatus("Creating " + def.singular + "...");
+    btn.disabled = true; setStatus("Checking...");
     try {
-      const body = {};
-      let series = null;
-      for (const f of def.fields) {
-        const v = controls[f.key].get();
-        if (f.kind === "noSeries") { if (v.series) series = v.series; else if (v.value) body.number = v.value; continue; }
-        if (v === "") continue;
-        if (f.kind === "paymentTerms") {
-          const pt = (await paymentTermsLookup()).find(x => String(x.code).toUpperCase() === v.toUpperCase());
-          if (!pt) throw new Error(`Payment terms ${v} does not exist in this company in BC.`);
-          body.paymentTermsId = pt.id; continue;
-        }
-        if (f.kind === "emails") {
-          const bad = v.split(";").map(x => x.trim()).filter(Boolean).filter(x => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(x));
-          if (bad.length) throw new Error("Email not valid: " + bad.join(", "));
-          body.email = v.split(";").map(x => x.trim()).filter(Boolean).join(";"); continue;
-        }
-        body[f.key] = f.type === "number" ? Number(v) : (f.upper ? v.toUpperCase() : v);
-      }
-      if (series) { setStatus(`Taking the next number from ${series}...`); body.number = await nextNumberFrom(series); }
-      const rec = await co(`/${def.endpoint}`, { method: "POST", body: JSON.stringify(body) });
-      setStatus(`Created ${def.singular} ${rec.number} - ${rec.displayName}`, "ok");
-      Object.values(controls).forEach(c => c.reset());
-      clearCache(def.endpoint);
-      refresh();
+      pending = await collect();
+      showPreview(pending);
+      setStatus(pending.warnings.length ? "Preview ready – please check the notes, then Create or go back." : "Preview ready. Check it, then click Create.", pending.warnings.length ? "warn" : "ok");
     } catch (e) { setStatus("Error: " + e.message, "err"); }
     finally { btn.disabled = false; }
   });
+
+  const createBtn = h("button", { type: "button", onclick: create }, "Create in BC");
+  async function create() {
+    if (!pending) return;
+    createBtn.disabled = true; setStatus("Creating " + def.singular + "...");
+    try {
+      const body = { ...pending.body };
+      if (pending.series) { setStatus(`Taking the next number from ${pending.series}...`); body.number = await nextNumberFrom(pending.series); }
+      const rec = await co(`/${def.endpoint}`, { method: "POST", body: JSON.stringify(body) });
+      setStatus(`Created ${def.singular} ${rec.number} - ${rec.displayName}`, "ok");
+      Object.values(controls).forEach(c => c.reset());
+      pending = null; backToEdit();
+      clearCache(def.endpoint);
+      refresh();
+    } catch (e) { setStatus("Error: " + e.message, "err"); }
+    finally { createBtn.disabled = false; }
+  }
 
   async function refresh() {
     try {
@@ -556,6 +612,7 @@ function buildMaster(key) {
 
   return h("div", {},
     h("div", { class: "card" }, h("h2", {}, "Create " + def.singular), form),
+    previewCard,
     h("div", { class: "card" }, h("h2", {}, "Latest " + def.title),
       h("div", { class: "row-actions" }, h("button", { type: "button", class: "ghost", onclick: refresh }, "Refresh")),
       listBox)
