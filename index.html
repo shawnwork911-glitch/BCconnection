@@ -40,6 +40,9 @@
   th { background:#f0f3f6; }
   td.num { text-align:right; }
   td.low { color:var(--danger); font-weight:600; }
+  .inv-sum { display:flex; flex-wrap:wrap; gap:1.5rem; margin-top:.9rem; padding:.7rem .9rem; background:#f7f9fb; border:1px solid var(--line); border-radius:6px; }
+  .inv-sum-lbl { font-size:.75rem; color:var(--muted); }
+  .inv-sum-val { font-size:1.3rem; font-weight:600; color:var(--accent); font-variant-numeric:tabular-nums; }
   td.wrap { white-space:normal; min-width:180px; max-width:280px; }
   table.lines td { padding:.25rem .4rem; }
   table.lines input { margin:0; padding:.35rem .45rem; }
@@ -658,34 +661,69 @@ function buildMaster(key) {
 function buildInventory() {
   const listBox = h("div", { class: "tablewrap" });
   const search = h("input", { type: "search", placeholder: "Search part no. or description" });
-  const onlyInv = h("input", { type: "checkbox", checked: true });
-  const lowOnly = h("input", { type: "checkbox" });
+  const COUNTRIES = ["MALAYSIA", "SINGAPORE", "VIETNAM"];
+  const mkSel = () => h("select", {}, h("option", { value: "" }, "All"));
+  const countrySel = h("select", {}, h("option", { value: "" }, "All"),
+    COUNTRIES.map(c => h("option", { value: c }, c.charAt(0) + c.slice(1).toLowerCase())));
+  const techSel = mkSel(), yearSel = mkSel(), regSel = mkSel();
   const count = h("span", { class: "muted" });
+  const totalQty = h("div", { class: "inv-sum-val" }, "–");
+  const totalVal = h("div", { class: "inv-sum-val" }, "–");
   let all = [];
 
   const cols = [["number","Part no."],["displayName","Description"],["inventory","Inventory"],
-                ["baseUnitOfMeasureCode","UoM"],["unitCost","Unit cost"],["unitPrice","Unit price"],["type","Type"]];
+                ["baseUnitOfMeasureCode","UoM"],["unitCost","Unit cost"],["type","Type"]];
+
+  // e.g. "MALAYSIA SMALL HYDRO RECS V24 (IREC)" -> country MALAYSIA, tech SMALL HYDRO, year 2024, registry IREC
+  function parseDesc(d) {
+    const s = String(d || "").toUpperCase().replace(/\s+/g, " ").trim();
+    const country = COUNTRIES.find(c => s.startsWith(c + " ")) || "";
+    const m = s.match(/^(.*?)\s*\bRECS?\b\s*V(\d{2})\b/);
+    const tech = m ? m[1].slice(country.length).trim() : "";
+    const year = m ? "20" + m[2] : "";
+    const reg = (s.match(/\(([^)]+)\)\s*$/) || [])[1] || "";
+    return { country, tech, year, reg: reg.trim() };
+  }
+
+  function fillSel(sel, values, label = v => v) {
+    const keep = sel.value;
+    sel.replaceChildren(h("option", { value: "" }, "All"), values.map(v => h("option", { value: v }, label(v))));
+    sel.value = values.includes(keep) ? keep : "";
+  }
+
+  const fmt = (n, dp = 2) => n.toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp });
 
   function draw() {
     const q = search.value.trim().toLowerCase();
+    const f = { country: countrySel.value, tech: techSel.value, year: yearSel.value, reg: regSel.value };
     const rows = all.filter(r =>
-      (!onlyInv.checked || r.type === "Inventory") &&
-      (!lowOnly.checked || (Number(r.inventory) || 0) <= CONFIG.lowStockThreshold) &&
+      (!f.country || r._p.country === f.country) &&
+      (!f.tech || r._p.tech === f.tech) &&
+      (!f.year || r._p.year === f.year) &&
+      (!f.reg || r._p.reg === f.reg) &&
       (!q || (r.number || "").toLowerCase().includes(q) || (r.displayName || "").toLowerCase().includes(q)));
     renderTable(listBox, cols, rows, [], {
       cellClass: (r, k) => k === "inventory" && r.type === "Inventory" && (Number(r.inventory) || 0) <= CONFIG.lowStockThreshold ? "low" : ""
     });
-    count.textContent = `${rows.length} of ${all.length} items`;
+    const qty = rows.reduce((s, r) => s + (Number(r.inventory) || 0), 0);
+    const val = rows.reduce((s, r) => s + (Number(r.inventory) || 0) * (Number(r.unitCost) || 0), 0);
+    totalQty.textContent = fmt(qty, 0);
+    totalVal.textContent = fmt(val, 2);
+    count.textContent = `${rows.length} of ${all.length} items in stock`;
   }
-  search.addEventListener("input", draw);
-  onlyInv.addEventListener("change", draw);
-  lowOnly.addEventListener("change", draw);
+  [search].forEach(el => el.addEventListener("input", draw));
+  [countrySel, techSel, yearSel, regSel].forEach(el => el.addEventListener("change", draw));
 
   async function refresh() {
     try {
       listBox.replaceChildren(h("p", { class: "muted" }, "Loading..."));
       const data = await co(`/items?$top=2000&$orderby=number`);
-      all = data.value;
+      all = data.value.filter(r => (Number(r.inventory) || 0) !== 0)   // hide zero stock
+                      .map(r => ({ ...r, _p: parseDesc(r.displayName) }));
+      const uniq = k => [...new Set(all.map(r => r._p[k]).filter(Boolean))].sort();
+      fillSel(techSel, uniq("tech"));
+      fillSel(yearSel, uniq("year"));
+      fillSel(regSel, uniq("reg"));
       draw();
     } catch (e) { listBox.replaceChildren(h("p", { class: "muted" }, "Could not load inventory: " + e.message)); }
   }
@@ -694,11 +732,16 @@ function buildInventory() {
   return h("div", {},
     h("div", { class: "card" }, h("h2", {}, "Inventory on hand"),
       h("div", { class: "grid" },
-        h("label", {}, "Search", search),
-        h("label", { class: "chk" }, onlyInv, "Inventory-type items only"),
-        h("label", { class: "chk" }, lowOnly, `Low stock only (≤ ${CONFIG.lowStockThreshold})`),
+        h("label", { class: "span2" }, "Search", search),
+        h("label", {}, "Country", countrySel),
+        h("label", {}, "Tech", techSel),
+        h("label", {}, "Year", yearSel),
+        h("label", {}, "Registry", regSel),
         h("button", { type: "button", class: "ghost", onclick: refresh }, "Refresh")),
-      h("div", { class: "row-actions" }, count)),
+      h("div", { class: "inv-sum" },
+        h("div", {}, h("div", { class: "inv-sum-lbl" }, "Total inventory"), totalQty),
+        h("div", {}, h("div", { class: "inv-sum-lbl" }, "Total value (Inventory × Unit cost)"), totalVal),
+        h("div", { style: "align-self:end" }, count))),
     h("div", { class: "card" }, listBox)
   );
 }
