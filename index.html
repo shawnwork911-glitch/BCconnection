@@ -127,13 +127,17 @@ const CONFIG = {
                 entities: { po: "purchaseLineExts", so: "salesLineExts", customers: "customerExts",
                             vendors: "vendorExts", vendorBanks: "vendorBankAccounts" } },   // vendor pages: v1.4
 
-  // Pending suppliers tab: reads the SharePoint list Trade Confirmation writes at Level 3 approval.
+  // Pending suppliers / customers tabs: read the SharePoint lists Trade Confirmation writes at approval.
   // Needs the delegated Graph permission Sites.ReadWrite.All on this app registration.
   graph: {
     scopes: ["https://graph.microsoft.com/Sites.ReadWrite.All"],
     siteHost: "saxonrenewables.sharepoint.com",
     sitePath: "/sites/Operations",
-    assetListId: "8c4f2f44-4662-4c4e-a56b-312772142c0d"   // Asset Approval Record List
+    assetListId: "8c4f2f44-4662-4c4e-a56b-312772142c0d",  // Asset Approval Record List (asset deals)
+    recListId:   "79178031-8d24-4c7b-9fd6-be94647c73be",  // BD Agreement Record Approved (RECs deals) – read only
+    ccListId:    "3cbc6ddc-3db8-4379-beae-3480d44245f1",  // Carbon Credit Approval List (CC deals) – read only
+    registerListName: "BC Counterparty Register",         // results for RECs / CC deals + auto-link memory
+    registerListId:   "acafe2f9-dcbe-4864-a2c3-8a2c1a52ee0c"  // its ID (List settings URL); blank = find it by name
   },
 
   // Approvals need their own custom API page (only used if features.approvals = true).
@@ -460,8 +464,9 @@ const ORDERS = {
 const TABS = [
   { id: "items",     label: "Part Number", build: () => buildMaster("items") },
   { id: "vendors",   label: "Supplier",    build: () => buildMaster("vendors") },
-  { id: "supplierQueue", label: "Pending suppliers", build: () => buildSupplierQueue() },
+  { id: "supplierQueue", label: "Pending suppliers", build: () => buildPartyQueue("supplier") },
   { id: "customers", label: "Customer",    build: () => buildMaster("customers") },
+  { id: "customerQueue", label: "Pending customers", build: () => buildPartyQueue("customer") },
   { id: "inventory", label: "Inventory",   build: () => buildInventory() },
   { id: "po",        label: "Purchase Order", build: () => buildOrder("po") },
   { id: "so",        label: "Sales Order",    build: () => buildOrder("so") },
@@ -666,16 +671,20 @@ function buildMaster(key) {
 }
 
 /* =====================================================================
-   PENDING SUPPLIERS tab
-   Asset deals approved at Level 3 in Trade Confirmation are written to the
-   SharePoint list "Asset Approval Record List" (one item per product).
-   This tab reads that list, groups the items by Asset ID, and lets the
-   reviewer Create the supplier in BC, Link it to an existing vendor, or
-   Reject it. The result is written back to the BC* columns on every list
-   item of the deal. Nothing is emailed from here.
+   PENDING SUPPLIERS / PENDING CUSTOMERS tabs
+   Approved deals from three SharePoint lists become BC suppliers or customers:
+     - Asset Approval Record List (asset deals)        -> suppliers
+       results are written to the BC* columns on the list items
+     - BD Agreement Record Approved (RECs deals)       -> Stock-In = supplier, Stock-Out = customer
+     - Carbon Credit Approval List (CC deals)          -> same
+       these two lists are only READ (their flows trigger on "modified");
+       results go to the "BC Counterparty Register" list instead.
+   Every Create / Link (asset deals too) also adds a register row, so a later
+   RECs / CC deal with the same name + Entity + role is auto-linked.
+   Nothing is emailed from here.
    ===================================================================== */
 
-/* ---------- Microsoft Graph (SharePoint list) ---------- */
+/* ---------- Microsoft Graph (SharePoint lists) ---------- */
 async function getGraphToken() {
   const req = { scopes: CONFIG.graph.scopes, account };
   try {
@@ -702,52 +711,95 @@ async function graphFetch(path, options = {}) {
   return res.status === 204 ? null : res.json();
 }
 
-/* BC* columns this tab writes. Display names as created in the list (see setup checklist). */
+/* BC* columns on the Asset Approval Record List (display names, see setup checklist) */
 const QCOL = {
   status: "BC Supplier Status", vendorNo: "BC Vendor No.", company: "BC Company",
   reviewedBy: "BC Reviewed By", reviewedDate: "BC Reviewed Date", rejectReason: "BC Reject Reason"
 };
-const QSTATUS = { pending: "Pending", creating: "Creating", created: "Created", linked: "Linked", rejected: "Rejected" };
+/* columns of the BC Counterparty Register list. The name goes to Title, and also to a "Counterparty"
+   column when the list was imported from Excel (SharePoint then names its columns field_1, field_2 ...) */
+const RCOL = {
+  name: "Title", source: "Source", role: "Role", entity: "Entity", nameKey: "Name Key", no: "BC No.",
+  company: "BC Company", status: "Status", reviewedBy: "Reviewed By", reviewedDate: "Reviewed Date",
+  rejectReason: "Reject Reason", ref: "Agreement ID"
+};
+const regName = r => fv(r, "Counterparty") || fv(r, RCOL.name);
+const QSTATUS = { pending: "Pending", creating: "Creating", created: "Created", linked: "Linked", rejected: "Rejected", auto: "Auto-linked" };
+const DONE = [QSTATUS.created, QSTATUS.linked, QSTATUS.rejected, QSTATUS.auto];
 
-let spCtx = null;   // { siteId, listId, col: displayName -> internal name }
-async function spContext() {
-  if (spCtx) return spCtx;
-  const g = CONFIG.graph;
-  const site = await graphFetch(`/sites/${g.siteHost}:${g.sitePath}?$select=id`);
-  const cols = await graphFetch(`/sites/${site.id}/lists/${g.assetListId}/columns?$select=name,displayName`);
-  const col = {};
-  cols.value.forEach(c => { col[c.displayName] = c.name; });
-  const missing = Object.values(QCOL).filter(d => !col[d]);
-  if (missing.length) throw new Error(`The Asset Approval Record List is missing these columns: ${missing.join(", ")}. Add them in SharePoint (see the setup checklist), then click Refresh.`);
-  spCtx = { siteId: site.id, listId: g.assetListId, col };
-  return spCtx;
+/* where each kind of deal comes from */
+const PARTY_SOURCES = {
+  asset: { label: "Asset", list: () => CONFIG.graph.assetListId, refCol: "Asset ID (Assigned to BD)", typeCol: "Agreement Type", required: Object.values(QCOL) },
+  rec:   { label: "RECs",  list: () => CONFIG.graph.recListId,   refCol: "Agreement ID (Assigned to BD)", typeCol: "Supply/Demand", required: [] },
+  cc:    { label: "CC",    list: () => CONFIG.graph.ccListId,    refCol: "Agreement ID (Assigned to BD)", typeCol: "Supply/Demand", required: [] }
+};
+const ROLE_DEF = {
+  supplier: { tab: "supplierQueue", tabLabel: "Pending suppliers", regRole: "Supplier", endpoint: "vendors", lookup: "vendors",
+              noun: "supplier", sources: ["asset", "rec", "cc"], title: "Suppliers from approved deals" },
+  customer: { tab: "customerQueue", tabLabel: "Pending customers", regRole: "Customer", endpoint: "customers", lookup: "customers",
+              noun: "customer", sources: ["rec", "cc"], title: "Customers from approved deals" }
+};
+function roleFromSupplyDemand(v) {
+  const s = String(v || "").trim().toLowerCase();
+  return s.startsWith("stock-in") ? "supplier" : s.startsWith("stock-out") ? "customer" : null;
 }
-function itemUrl(ctx, id) { return `/sites/${ctx.siteId}/lists/${ctx.listId}/items/${id}`; }
-async function spAllItems() {
-  const ctx = await spContext();
+const strictKey = s => normName(s);   // auto-link key: ignores case, spaces and punctuation only
+
+let spSiteId = null;
+const spCtxs = {};   // list id / title -> { siteId, listId, col }
+async function spSite() {
+  if (!spSiteId) spSiteId = (await graphFetch(`/sites/${CONFIG.graph.siteHost}:${CONFIG.graph.sitePath}?$select=id`)).id;
+  return spSiteId;
+}
+/* ref = list id, or { title } ; required = display names that must exist */
+async function spList(ref, required = []) {
+  const k = typeof ref === "string" ? ref : "title:" + ref.title;
+  if (spCtxs[k]) return spCtxs[k];
+  const siteId = await spSite();
+  let listId = ref, label = ref;
+  if (typeof ref !== "string") {
+    const lists = await graphFetch(`/sites/${siteId}/lists?$select=id,displayName&$top=500`);
+    const hit = lists.value.find(l => (l.displayName || "").toLowerCase() === ref.title.toLowerCase());
+    if (!hit) throw new Error(`The SharePoint list "${ref.title}" does not exist on the Operations site yet – create it (see the setup checklist).`);
+    listId = hit.id; label = ref.title;
+  }
+  const cols = await graphFetch(`/sites/${siteId}/lists/${listId}/columns?$select=name,displayName`);
+  const col = { Title: "Title" };
+  cols.value.forEach(c => { col[c.displayName] = c.name; });
+  const missing = required.filter(d => !col[d]);
+  if (missing.length) throw new Error(`The list "${label}" is missing these columns: ${missing.join(", ")}. Add them in SharePoint (see the setup checklist), then click Refresh.`);
+  return (spCtxs[k] = { siteId, listId, col, label });
+}
+const regRef = () => CONFIG.graph.registerListId || { title: CONFIG.graph.registerListName || "BC Counterparty Register" };
+const regList = () => spList(regRef(), Object.values(RCOL).filter(c => c !== "Title"));
+function itemUrl(ctx, id) { return `/sites/${ctx.siteId}/lists/${ctx.listId}/items${id ? "/" + id : ""}`; }
+const wrapItem = (ctx, i) => ({ id: i.id, eTag: i.eTag, f: i.fields || {}, ctx });
+async function spItems(ctx) {
   const out = [];
-  let url = `/sites/${ctx.siteId}/lists/${ctx.listId}/items?$expand=fields&$top=500`;
+  let url = itemUrl(ctx) + "?$expand=fields&$top=500";
   while (url) {
     const d = await graphFetch(url);
-    out.push(...d.value.map(i => ({ id: i.id, eTag: i.eTag, f: i.fields || {} })));
+    out.push(...d.value.map(i => wrapItem(ctx, i)));
     url = d["@odata.nextLink"];
   }
   return out;
 }
-async function spGetItem(id) {
-  const ctx = await spContext();
-  const i = await graphFetch(itemUrl(ctx, id) + "?$expand=fields");
-  return { id: i.id, eTag: i.eTag, f: i.fields || {} };
-}
-/* write { displayName: value } to one list item; If-Match makes it fail with 412 when someone changed it first */
-async function spWrite(id, byDisplayName, eTag) {
-  const ctx = await spContext();
+async function spGet(ctx, id) { return wrapItem(ctx, await graphFetch(itemUrl(ctx, id) + "?$expand=fields")); }
+function spFields(ctx, byDisplayName) {
   const body = {};
   for (const [d, v] of Object.entries(byDisplayName)) if (ctx.col[d]) body[ctx.col[d]] = v;
-  return graphFetch(itemUrl(ctx, id) + "/fields", { method: "PATCH", headers: eTag ? { "If-Match": eTag } : {}, body: JSON.stringify(body) });
+  return body;
 }
+/* write { displayName: value }; If-Match makes it fail with 412 when someone changed it first */
+async function spWrite(ctx, id, byDisplayName, eTag) {
+  return graphFetch(itemUrl(ctx, id) + "/fields", { method: "PATCH", headers: eTag ? { "If-Match": eTag } : {}, body: JSON.stringify(spFields(ctx, byDisplayName)) });
+}
+async function spCreate(ctx, byDisplayName) {
+  return wrapItem(ctx, await graphFetch(itemUrl(ctx), { method: "POST", body: JSON.stringify({ fields: spFields(ctx, byDisplayName) }) }));
+}
+async function spDelete(ctx, id) { return graphFetch(itemUrl(ctx, id), { method: "DELETE" }); }
 function fv(item, displayName) {
-  const name = spCtx && spCtx.col[displayName];
+  const name = item && item.ctx && item.ctx.col[displayName];
   const v = name ? item.f[name] : undefined;
   return v == null ? "" : String(v).trim();
 }
@@ -826,17 +878,89 @@ function matchPaymentTerm(text) {
 
 const nameKey = s => normName(String(s || "").replace(/\b(sdn\.?\s*bhd\.?|bhd\.?|berhad|pte\.?\s*ltd\.?|private limited|limited|ltd\.?|plt|llp|inc\.?|corp\.?|co\.?)\b/gi, ""));
 function vendorSetup() { return SETTINGS.vendorSetup || {}; }
+function customerSetup() { return SETTINGS.customerSetup || {}; }
 function queueSettings() { return SETTINGS.supplierQueue || {}; }
+const fmtDate = d => d ? d.toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "numeric" }) : "";
+const odq = s => String(s).replace(/'/g, "''");   // OData string literal
 
-/* ---------- the tab ---------- */
-function buildSupplierQueue() {
+/* ---------- loading: list items -> one group per deal ---------- */
+/* asset deals: grouped by Asset ID + Entity, status from the BC* columns on the list */
+function assetGroups(items, since) {
+  const map = new Map();
+  for (const it of items) {
+    const st = fv(it, QCOL.status);
+    const done = [QSTATUS.created, QSTATUS.linked, QSTATUS.rejected].includes(st);
+    const ref = fv(it, "Asset ID (Assigned to BD)") || `(item ${it.id})`;
+    const entity = fv(it, "Entity").toUpperCase();
+    const key = `asset|${ref}|${entity}|${done ? "done:" + st + ":" + fv(it, QCOL.vendorNo) : "open"}`;
+    if (!map.has(key)) map.set(key, { key, source: "asset", role: "supplier", ref, entity, done, items: [] });
+    map.get(key).items.push(it);
+  }
+  const out = [...map.values()];
+  out.forEach(g => {
+    finishGroup(g, since);
+    const p = g.primary;
+    g.company = fv(p, "Agreement Company Name") || fv(p, "Supplier");
+    g.status = fv(p, QCOL.status) || QSTATUS.pending;
+    g.partyNo = fv(p, QCOL.vendorNo); g.bcCompany = fv(p, QCOL.company);
+    g.reviewedBy = fv(p, QCOL.reviewedBy); g.reviewedDate = fv(p, QCOL.reviewedDate); g.rejectReason = fv(p, QCOL.rejectReason);
+  });
+  out.forEach(g => { if (!g.done) g.earlier = out.filter(x => x.done && x.ref === g.ref && x.entity === g.entity && x.status !== QSTATUS.rejected); });
+  return out;
+}
+/* RECs / CC deals: grouped by Agreement ID + Entity + role; status from the register */
+function tradeGroups(items, srcKey, role, reg, since) {
+  const src = PARTY_SOURCES[srcKey];
+  const map = new Map();
+  for (const it of items) {
+    if (roleFromSupplyDemand(fv(it, "Supply/Demand")) !== role) continue;
+    const ref = fv(it, src.refCol) || `(item ${it.id})`;
+    const entity = fv(it, "Entity").toUpperCase();
+    const key = `${srcKey}|${ref}|${entity}|${role}`;
+    if (!map.has(key)) map.set(key, { key, source: srcKey, role, ref, entity, items: [] });
+    map.get(key).items.push(it);
+  }
+  const regRole = ROLE_DEF[role].regRole;
+  return [...map.values()].map(g => {
+    finishGroup(g, since);
+    g.company = fv(g.primary, "Company");
+    const k = strictKey(g.company);
+    const mine = reg.filter(r => fv(r, RCOL.role) === regRole && fv(r, RCOL.entity).toUpperCase() === g.entity);
+    const own = mine.filter(r => fv(r, RCOL.ref) === g.ref && fv(r, RCOL.source) === src.label).sort((a, b) => Number(b.id) - Number(a.id));
+    const ownDone = own.find(r => [QSTATUS.created, QSTATUS.linked, QSTATUS.rejected].includes(fv(r, RCOL.status)));
+    const byName = mine.find(r => k && fv(r, RCOL.nameKey) === k && [QSTATUS.created, QSTATUS.linked].includes(fv(r, RCOL.status)));
+    const reg0 = ownDone || (byName ? null : own.find(r => fv(r, RCOL.status) === QSTATUS.creating));
+    if (ownDone) { g.done = true; g.status = fv(ownDone, RCOL.status); }
+    else if (byName) { g.done = true; g.status = QSTATUS.auto; g.autoFrom = byName; }
+    else { g.done = false; g.status = reg0 ? QSTATUS.creating : QSTATUS.pending; }
+    const r = ownDone || byName || reg0;
+    g.regRow = reg0 || null;
+    if (r) {
+      g.partyNo = fv(r, RCOL.no); g.bcCompany = fv(r, RCOL.company); g.reviewedBy = fv(r, RCOL.reviewedBy);
+      g.reviewedDate = fv(r, RCOL.reviewedDate); g.rejectReason = byName && !ownDone ? `Same name as ${fv(r, RCOL.source)} ${fv(r, RCOL.ref)}` : fv(r, RCOL.rejectReason);
+    }
+    return g;
+  });
+}
+function finishGroup(g, since) {
+  g.items.sort((a, b) => Number(a.id) - Number(b.id));
+  g.primary = g.items[0];
+  g.typeLabel = fv(g.primary, PARTY_SOURCES[g.source].typeCol);
+  const d = new Date(fv(g.primary, "Approved Date"));
+  g.approvedTime = isNaN(d) ? null : d;
+  g.beforeCutoff = !!(since && g.approvedTime && g.approvedTime < since);
+}
+
+/* ---------- the tab (one per role) ---------- */
+function buildPartyQueue(role) {
+  const R = ROLE_DEF[role];
   const listBox = h("div", { class: "tablewrap" });
   const reviewBox = h("div", {});
-  const note = h("p", { class: "muted small", style: "margin:.25rem 0 .5rem" });
-  const filter = h("input", { type: "search", placeholder: "Search Asset ID or company", style: "max-width:280px" });
+  const note = h("div", { class: "muted small", style: "margin:.25rem 0 .5rem" });
+  const filter = h("input", { type: "search", placeholder: "Search ID or company", style: "max-width:240px" });
   const btnPending = h("button", { type: "button", class: "small" }, "Pending");
   const btnDone = h("button", { type: "button", class: "small ghost" }, "Processed");
-  let view = "pending", groups = [], openKey = null;
+  let view = "pending", groups = [], openKey = null, loadNotes = [], register = [];
 
   function setView(v) {
     view = v;
@@ -849,130 +973,120 @@ function buildSupplierQueue() {
   btnDone.addEventListener("click", () => setView("done"));
   filter.addEventListener("input", () => draw());
 
-  /* list items -> one group per deal (Asset ID + Entity), split into pending / processed */
-  function groupItems(items) {
-    const since = queueSettings().since ? new Date(queueSettings().since) : null;
-    const map = new Map();
-    for (const it of items) {
-      const st = fv(it, QCOL.status);
-      const done = [QSTATUS.created, QSTATUS.linked, QSTATUS.rejected].includes(st);
-      const assetId = fv(it, "Asset ID (Assigned to BD)") || `(item ${it.id})`;
-      const entity = fv(it, "Entity").toUpperCase();
-      const key = `${assetId}|${entity}|${done ? "done:" + st + ":" + fv(it, QCOL.vendorNo) : "open"}`;
-      if (!map.has(key)) map.set(key, { key, assetId, entity, done, items: [] });
-      map.get(key).items.push(it);
-    }
-    const out = [...map.values()];
-    out.forEach(g => {
-      g.items.sort((a, b) => Number(a.id) - Number(b.id));
-      g.primary = g.items[0];
-      g.status = fv(g.primary, QCOL.status) || QSTATUS.pending;
-      g.approvedDate = fv(g.primary, "Approved Date");
-      const d = new Date(g.approvedDate);
-      g.approvedTime = isNaN(d) ? null : d;
-      g.company = fv(g.primary, "Agreement Company Name") || fv(g.primary, "Supplier");
-      g.beforeCutoff = !g.done && since && g.approvedTime && g.approvedTime < since;
-    });
-    // remember earlier results for the same Asset ID (shown as a hint on new items)
-    out.forEach(g => { if (!g.done) g.earlier = out.filter(x => x.done && x.assetId === g.assetId && x.entity === g.entity && x.status !== QSTATUS.rejected); });
-    return out.sort((a, b) => (b.approvedTime || 0) - (a.approvedTime || 0));
-  }
-
   function statusTag(st) {
-    const cls = st === QSTATUS.created || st === QSTATUS.linked ? "tag ok" : st === QSTATUS.rejected || st === QSTATUS.creating ? "tag warn" : "tag";
+    const cls = [QSTATUS.created, QSTATUS.linked, QSTATUS.auto].includes(st) ? "tag ok" : st === QSTATUS.rejected || st === QSTATUS.creating ? "tag warn" : "tag";
     return h("span", { class: cls }, st === QSTATUS.creating ? "Interrupted – retry" : st);
   }
-  const fmtDate = d => d ? d.toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "numeric" }) : "";
 
   function draw() {
     const g0 = companyGroup();
     const q = filter.value.trim().toLowerCase();
-    const mine = groups.filter(g => g.entity === g0);
-    const others = groups.filter(g => g.entity !== g0 && !g.done && !g.beforeCutoff);
-    const rows = mine.filter(g => (view === "pending" ? (!g.done && !g.beforeCutoff) : g.done) &&
-      (!q || g.assetId.toLowerCase().includes(q) || g.company.toLowerCase().includes(q)));
-    const pendingCount = mine.filter(g => !g.done && !g.beforeCutoff).length;
-    setTabBadge(pendingCount);
+    const live = groups.filter(g => !g.beforeCutoff);
+    const mine = live.filter(g => g.entity === g0);
+    const others = live.filter(g => g.entity !== g0 && !g.done);
+    const rows = mine.filter(g => (view === "pending" ? !g.done : g.done) &&
+      (!q || g.ref.toLowerCase().includes(q) || g.company.toLowerCase().includes(q)));
+    setTabBadge(R, mine.filter(g => !g.done).length);
     note.replaceChildren(
-      `Showing ${g0 || "?"} deals for ${companyName()}.`,
-      others.length ? ` ${others.length} pending deal(s) belong to the other company – switch company at the top to see them.` : "",
-      view === "pending" && queueSettings().since ? ` Deals approved before ${queueSettings().since} are not listed.` : "");
+      h("div", {}, `Showing ${g0 || "?"} deals for ${companyName()}.`,
+        others.length ? ` ${others.length} pending deal(s) belong to the other company – switch company at the top to see them.` : "",
+        queueSettings().since ? ` Deals approved before ${queueSettings().since} are not listed.` : ""),
+      ...loadNotes.map(n => h("div", {}, h("span", { class: "tag warn" }, "Check"), " ", n)));
     if (!g0) { listBox.replaceChildren(h("p", { class: "muted" }, "This company is not matched to MY or SG in presets.js (companyGroups).")); return; }
     if (!rows.length) { listBox.replaceChildren(h("p", { class: "muted" }, view === "pending" ? "Nothing waiting." : "No processed deals yet.")); return; }
+    const src = g => PARTY_SOURCES[g.source].label;
     if (view === "pending") {
       listBox.replaceChildren(h("table", {},
-        h("thead", {}, h("tr", {}, ["Asset ID", "Company", "Agreement type", "Approved", "Products", "Status", ""].map(x => h("th", {}, x)))),
+        h("thead", {}, h("tr", {}, ["Source", "Asset / Agreement ID", R.noun === "customer" ? "Buyer" : "Supplier", "Type", "Approved", "Items", "Status", ""].map(x => h("th", {}, x)))),
         h("tbody", {}, rows.map(g => h("tr", {},
-          h("td", {}, g.assetId), h("td", { class: "wrap" }, g.company),
-          h("td", {}, fv(g.primary, "Agreement Type")), h("td", {}, fmtDate(g.approvedTime)),
+          h("td", {}, h("span", { class: "tag" }, src(g))), h("td", {}, g.ref), h("td", { class: "wrap" }, g.company),
+          h("td", {}, g.typeLabel), h("td", {}, fmtDate(g.approvedTime)),
           h("td", { class: "num" }, String(g.items.length)), h("td", {}, statusTag(g.status)),
           h("td", {}, h("button", { type: "button", class: "small" + (openKey === g.key ? "" : " ghost"), onclick: () => openReview(g) }, "Review")))))));
     } else {
       listBox.replaceChildren(h("table", {},
-        h("thead", {}, h("tr", {}, ["Asset ID", "Company", "Result", "BC Vendor No.", "BC company", "Reviewed by", "Date", "Reason"].map(x => h("th", {}, x)))),
-        h("tbody", {}, rows.map(g => { const d = new Date(fv(g.primary, QCOL.reviewedDate)); return h("tr", {},
-          h("td", {}, g.assetId), h("td", { class: "wrap" }, g.company), h("td", {}, statusTag(g.status)),
-          h("td", {}, fv(g.primary, QCOL.vendorNo)), h("td", { class: "wrap" }, fv(g.primary, QCOL.company)),
-          h("td", {}, fv(g.primary, QCOL.reviewedBy)), h("td", {}, isNaN(d) ? "" : fmtDate(d)),
-          h("td", { class: "wrap" }, fv(g.primary, QCOL.rejectReason))); }))));
+        h("thead", {}, h("tr", {}, ["Source", "Asset / Agreement ID", "Company", "Result", "BC No.", "BC company", "Reviewed by", "Date", "Reason / note"].map(x => h("th", {}, x)))),
+        h("tbody", {}, rows.map(g => { const d = new Date(g.reviewedDate); return h("tr", {},
+          h("td", {}, h("span", { class: "tag" }, src(g))), h("td", {}, g.ref), h("td", { class: "wrap" }, g.company), h("td", {}, statusTag(g.status)),
+          h("td", {}, g.partyNo || ""), h("td", { class: "wrap" }, g.bcCompany || ""),
+          h("td", {}, g.reviewedBy || ""), h("td", {}, isNaN(d) ? "" : fmtDate(d)),
+          h("td", { class: "wrap" }, g.rejectReason || "")); }))));
     }
   }
 
   async function refresh() {
-    listBox.replaceChildren(h("p", { class: "muted" }, "Loading the Asset Approval Record List..."));
-    try {
-      groups = groupItems(await spAllItems());
-      draw();
-      if (openKey) { const g = groups.find(x => x.key === openKey && !x.done); if (g) openReview(g); else { reviewBox.replaceChildren(); openKey = null; } }
-    } catch (e) {
-      listBox.replaceChildren(h("p", { class: "muted" }, "Could not load the list: " + e.message));
-    }
+    listBox.replaceChildren(h("p", { class: "muted" }, "Loading approved deals from SharePoint..."));
+    const since = queueSettings().since ? new Date(queueSettings().since) : null;
+    const notes = [], out = [];
+    try { register = await spItems(await regList()); }
+    catch (e) { register = []; notes.push("Register: " + e.message + " RECs and Carbon Credit deals cannot be shown until it exists."); }
+    const regOk = !notes.length;
+    await Promise.all(R.sources.map(async s => {
+      const src = PARTY_SOURCES[s];
+      if (s !== "asset" && !regOk) return;
+      try {
+        const ctx = await spList(src.list(), src.required);
+        const items = await spItems(ctx);
+        out.push(...(s === "asset" ? assetGroups(items, since) : tradeGroups(items, s, role, register, since)));
+      } catch (e) { notes.push(`${src.label}: ${e.message}`); }
+    }));
+    groups = out.sort((a, b) => (b.approvedTime || 0) - (a.approvedTime || 0));
+    loadNotes = notes;
+    draw();
+    if (openKey) { const g = groups.find(x => x.key === openKey && !x.done); if (g) openReview(g); else { reviewBox.replaceChildren(); openKey = null; } }
   }
-  refreshers.supplierQueue = refresh;
+  refreshers[R.tab] = refresh;
 
-  /* ---------- review card for one deal ---------- */
   async function openReview(g) {
     openKey = g.key; draw();
     reviewBox.replaceChildren(h("div", { class: "card" }, h("p", { class: "muted" }, "Preparing review...")));
     try { reviewBox.replaceChildren(await buildReview(g)); reviewBox.scrollIntoView({ behavior: "smooth", block: "start" }); }
     catch (e) { reviewBox.replaceChildren(h("div", { class: "card" }, h("p", {}, "Could not prepare the review: " + e.message))); }
   }
+  function closeReview() { reviewBox.replaceChildren(); openKey = null; refresh(); }
 
+  /* ---------- review card for one deal ---------- */
   async function buildReview(g) {
-    const p = g.primary, vs = vendorSetup(), grp = companyGroup();
+    const p = g.primary, grp = companyGroup(), isAsset = g.source === "asset", isSupplier = role === "supplier";
+    const vs = vendorSetup(), cs = customerSetup();
     const series = queueSettings().noSeries || "PP-VENNO1";
-    const [hasVendorExt, hasBankExt] = await Promise.all([lineExtAvailable("vendors"), lineExtAvailable("vendorBanks")]);
+    const extKind = isSupplier ? "vendors" : "customers";
+    const [hasExt, hasBankExt] = await Promise.all([lineExtAvailable(extKind), isSupplier ? lineExtAvailable("vendorBanks") : Promise.resolve(false)]);
     let myInvois = false;
-    if (hasVendorExt && grp === "MY") {
-      try { const d = await bcFetch(extBase("vendors") + "?$top=1&$select=myInvoisFieldsAvailable"); myInvois = !!(d.value[0] && d.value[0].myInvoisFieldsAvailable); }
-      catch { myInvois = false; }
+    if (hasExt && grp === "MY") {
+      if (isSupplier) {
+        try { const d = await bcFetch(extBase("vendors") + "?$top=1&$select=myInvoisFieldsAvailable"); myInvois = !!(d.value[0] && d.value[0].myInvoisFieldsAvailable); }
+        catch { myInvois = false; }
+      } else myInvois = true;   // customerExts (v1.3) is used for MyInvois in the MY company already
     }
 
     // ----- prefill -----
-    const addr = splitAddress(fv(p, "Invoice Address"));
-    const country = (addr.country || fv(p, "Device Country") || g.entity || "").toUpperCase();
+    const addr = splitAddress(isAsset ? fv(p, "Invoice Address") : "");
+    const dealCountry = fv(p, "Country") || fv(p, "Device Country");
+    const country = (addr.country || (isAsset ? fv(p, "Device Country") : "") || g.entity || "").toUpperCase();
     const ptText = fv(p, "Payment Term");
     const ptCode = matchPaymentTerm(ptText);
     const dealCcy = fv(p, "Currency").toUpperCase();
     const lcy = (vs.localCurrency || { MY: "MYR", SG: "SGD" })[grp] || "";
     const isLocal = country === grp;
-    const d = vs.defaults || {};
-    const regNo = fv(p, "Registration Number");
-    const residential = /^y/i.test(fv(p, "Residential"));
-    const swift = fv(p, "Swift Code").toUpperCase().replace(/\s/g, "");
+    const vd = vs.defaults || {}, cd = cs.defaults || {};
+    const regNo = isAsset ? fv(p, "Registration Number") : "";
+    const residential = isAsset && /^y/i.test(fv(p, "Residential"));
+    const swift = isAsset ? fv(p, "Swift Code").toUpperCase().replace(/\s/g, "") : "";
     const pre = {
-      displayName: (fv(p, "Agreement Company Name") || fv(p, "Supplier")).toUpperCase(),
-      email: (fv(p, "Finance Email") || fv(p, "Email")).replace(/[,\s]+/g, ";").replace(/;+/g, ";").replace(/^;|;$/g, ""),
-      phoneNumber: fv(p, "Phone Number"),
+      displayName: (g.company || "").toUpperCase(),
+      email: isAsset ? (fv(p, "Finance Email") || fv(p, "Email")).replace(/[,\s]+/g, ";").replace(/;+/g, ";").replace(/^;|;$/g, "") : "",
+      phoneNumber: isAsset ? fv(p, "Phone Number") : "",
       addressLine1: addr.addressLine1.toUpperCase(), addressLine2: addr.addressLine2.toUpperCase(),
       city: addr.city.toUpperCase(), postalCode: addr.postalCode, country,
       paymentTerms: ptCode, currencyCode: dealCcy && dealCcy !== lcy ? dealCcy : "",
-      genBusPostingGroup: isLocal ? (d.genBusLocal || "LOCAL") : (d.genBusOverseas || "OVERSEAS"),
-      vendorPostingGroup: d.vendorPostingGroup || "TRADE",
-      vatBusPostingGroup: isLocal ? (d.vatBusLocal || "LOCAL") : (d.vatBusOverseas || "EXPORT"),
+      genBusPostingGroup: isLocal ? ((isSupplier ? vd.genBusLocal : cd.genBusLocal) || "LOCAL") : ((isSupplier ? vd.genBusOverseas : cd.genBusOverseas) || "OVERSEAS"),
+      vendorPostingGroup: vd.vendorPostingGroup || "TRADE",
+      customerPostingGroup: cd.customerPostingGroup || "TRADE",
+      vatBusPostingGroup: isLocal ? (vd.vatBusLocal || "LOCAL") : (vd.vatBusOverseas || "EXPORT"),
       registrationNumber: regNo,
-      taxIdentificationNo: "", idType: residential ? "NRIC" : "BRN", idNo: regNo,
-      bankName: fv(p, "Bank Name").toUpperCase(), bankAccountNo: fv(p, "Bank Account Number").replace(/\s/g, ""),
+      taxIdentificationNo: "", idType: residential ? "NRIC" : (cd.idType || "BRN"), idNo: regNo,
+      bankName: isAsset ? fv(p, "Bank Name").toUpperCase() : "", bankAccountNo: isAsset ? fv(p, "Bank Account Number").replace(/\s/g, "") : "",
       swiftCode: swift, bankCode: (swift || "MAIN").slice(0, 20)
     };
 
@@ -1001,70 +1115,79 @@ function buildSupplierQueue() {
         try { await navigator.clipboard.writeText(ctl[key].get()); ev.target.textContent = "Copied"; setTimeout(() => ev.target.textContent = "Copy", 1200); } catch {} } }, "Copy");
     }
 
-    const vendorFields = h("div", { class: "grid" },
-      h("label", {}, "Supplier ID", h("input", { type: "text", value: `${series} (next no.)`, disabled: true }), h("div", { class: "muted small" }, "Fixed for asset suppliers")),
+    const idBox = isSupplier
+      ? h("label", {}, "Supplier ID", h("input", { type: "text", value: `${series} (next no.)`, disabled: true }), h("div", { class: "muted small" }, "Fixed for deal suppliers"))
+      : h("label", {}, "Customer ID", h("input", { type: "text", value: "Given by BC", disabled: true }), h("div", { class: "muted small" }, "BC default numbering"));
+    const cardFields = h("div", { class: "grid" }, idBox,
       input("displayName", "Name", { required: true, upper: true, max: 100, span: true }),
-      input("email", "Email (separate several with ;)", { max: 80, span: true }),
+      input("email", "Email (separate several with ;)", { max: 80, span: true, hint: isAsset ? "" : "Not on the deal – type it in" }),
       input("phoneNumber", "Phone", { max: 30 }),
       input("addressLine1", "Address", { upper: true, max: 100, span: true }),
       input("addressLine2", "Address 2", { upper: true, max: 50 }),
       input("city", "City", { upper: true, max: 30 }),
       input("postalCode", "Postal code", { upper: true, max: 20 }),
-      input("country", "Country code", { upper: true, max: 10 }),
+      input("country", "Country code", { upper: true, max: 10, hint: isAsset ? "" : `From Entity. Deal country: ${dealCountry || "(blank)"}` }),
       input("paymentTerms", "Payment Terms Code", { groups: SETTINGS.paymentTerms || [], hint: `Deal says: “${ptText || "(blank)"}”` + (ptCode ? "" : " – no match, please choose") }),
       input("currencyCode", "Currency (blank = " + (lcy || "local") + ")", { upper: true, max: 10, hint: `Deal currency: ${dealCcy || "(blank)"}` }));
 
-    const regLabel = input("registrationNumber", "Registration Number", { upper: true, max: 50 });
+    const regLabel = isSupplier ? input("registrationNumber", "Registration Number", { upper: true, max: 50 }) : null;
+    const myRequired = !isSupplier && grp === "MY";
     const extFields = h("div", { class: "grid" },
-      input("genBusPostingGroup", "Gen. Bus. Posting Group", { required: true, ext: true, options: vs.genBusPostingGroups || (SETTINGS.customerSetup || {}).genBusPostingGroups }),
-      input("vendorPostingGroup", "Vendor Posting Group", { required: true, ext: true, options: vs.vendorPostingGroups }),
-      input("vatBusPostingGroup", "VAT Bus. Posting Group", { required: true, ext: true, options: vs.vatBusPostingGroups || (SETTINGS.vatGroups || {}).po }),
-      ...(hasVendorExt ? [regLabel] : []),
+      input("genBusPostingGroup", "Gen. Bus. Posting Group", { required: true, ext: true, options: (isSupplier ? vs.genBusPostingGroups : null) || cs.genBusPostingGroups }),
+      isSupplier
+        ? [input("vendorPostingGroup", "Vendor Posting Group", { required: true, ext: true, options: vs.vendorPostingGroups }),
+           input("vatBusPostingGroup", "VAT Bus. Posting Group", { required: true, ext: true, options: vs.vatBusPostingGroups || (SETTINGS.vatGroups || {}).po }),
+           hasExt ? regLabel : ""]
+        : input("customerPostingGroup", "Customer Posting Group", { required: true, ext: true, options: cs.customerPostingGroups }),
       ...(myInvois ? [
-        input("taxIdentificationNo", "Tax Identification No. (TIN)", { upper: true, max: 100, hint: "Not captured in Trade Confirmation – optional" }),
-        input("idType", "ID Type", { options: vs.idTypes || (SETTINGS.customerSetup || {}).idTypes, hint: residential ? "Residential = Yes → NRIC" : "Residential = No → BRN" }),
-        input("idNo", "ID No.", { upper: true, max: 100 })
+        input("taxIdentificationNo", "Tax Identification No. (TIN)", { upper: true, max: 100, ext: true, hint: "Optional" }),
+        input("idType", "ID Type", { options: (isSupplier ? vs.idTypes : null) || cs.idTypes, ext: true, required: myRequired, hint: isAsset ? (residential ? "Residential = Yes → NRIC" : "Residential = No → BRN") : "" }),
+        input("idNo", "ID No.", { upper: true, max: 100, ext: true, required: myRequired, hint: isAsset ? "" : "Company registration no. (BRN) or NRIC" })
       ] : []));
 
-    const bankFields = h("div", { class: "grid" },
+    const bankFields = isSupplier ? h("div", { class: "grid" },
       h("div", {}, input("bankName", "Bank name", { upper: true, max: 100 }), copyBtn("bankName")),
       h("div", {}, input("bankAccountNo", "Bank account no.", { max: 30 }), copyBtn("bankAccountNo")),
       h("div", {}, input("swiftCode", "SWIFT code", { upper: true, max: 20 }), copyBtn("swiftCode")),
       hasBankExt ? input("bankCode", "Bank account code in BC", { upper: true, max: 20, hint: "SWIFT code, or MAIN" }) : "",
-      hasVendorExt ? "" : h("div", {}, regLabel, copyBtn("registrationNumber")));
+      hasExt ? "" : h("div", {}, regLabel, copyBtn("registrationNumber"))) : null;
 
-    // ----- duplicate check -----
+    // ----- duplicate check: BC records + the register -----
     const dupBox = h("div", {});
     const linkArea = h("div", {});
     let matches = [];
     async function runDupCheck() {
-      dupBox.replaceChildren(h("p", { class: "muted small" }, "Checking BC for existing suppliers..."));
+      dupBox.replaceChildren(h("p", { class: "muted small" }, "Checking BC for existing records..."));
       try {
-        const vendors = await lookups.vendors();
-        const byNo = new Map(vendors.map(v => [v.number, v]));
+        const recs = await lookups[R.lookup]();
+        const byNo = new Map(recs.map(v => [v.number, v]));
         const found = new Map();
-        const reg = ctl.registrationNumber.get();
-        if (reg && hasVendorExt) {
+        const reg = ctl.registrationNumber ? ctl.registrationNumber.get() : "";
+        if (isSupplier && reg && hasExt) {
           try {
-            const r = await bcFetch(extBase("vendors") + `?$filter=registrationNumber eq '${reg.replace(/'/g, "''")}'&$select=number,displayName,registrationNumber`);
+            const r = await bcFetch(extBase("vendors") + `?$filter=registrationNumber eq '${odq(reg)}'&$select=number,displayName,registrationNumber`);
             r.value.forEach(x => found.set(x.number, { ...(byNo.get(x.number) || x), why: "same registration number" }));
           } catch {}
         }
         const k = nameKey(ctl.displayName.get());
-        if (k.length >= 3) vendors.forEach(v => {
+        if (k.length >= 3) recs.forEach(v => {
           const vk = nameKey(v.displayName);
           if (!found.has(v.number) && vk && (vk === k || (vk.length >= 6 && k.length >= 6 && (vk.includes(k) || k.includes(vk)))))
             found.set(v.number, { ...v, why: vk === k ? "same name" : "similar name" });
         });
-        (g.earlier || []).forEach(e => { const no = fv(e.primary, QCOL.vendorNo); if (no && !found.has(no)) found.set(no, { ...(byNo.get(no) || { number: no, displayName: "" }), why: `used for this Asset ID before (${e.status})` }); });
+        // the register: earlier decisions for a similar name (same role + entity)
+        register.filter(r => fv(r, RCOL.role) === R.regRole && fv(r, RCOL.entity).toUpperCase() === g.entity &&
+            [QSTATUS.created, QSTATUS.linked].includes(fv(r, RCOL.status)) && fv(r, RCOL.no) && nameKey(regName(r)) === k)
+          .forEach(r => { const no = fv(r, RCOL.no); if (!found.has(no)) found.set(no, { ...(byNo.get(no) || { number: no, displayName: regName(r) }), why: `used for ${fv(r, RCOL.source)} ${fv(r, RCOL.ref)}` }); });
+        (g.earlier || []).forEach(e => { const no = e.partyNo; if (no && !found.has(no)) found.set(no, { ...(byNo.get(no) || { number: no, displayName: "" }), why: `used for this Asset ID before (${e.status})` }); });
         matches = [...found.values()];
         dupBox.replaceChildren(matches.length
-          ? h("div", { class: "fx" }, h("h2", {}, "This supplier may already exist in BC"),
-              h("table", {}, h("thead", {}, h("tr", {}, ["Vendor", "Name", "City", "Why", ""].map(x => h("th", {}, x)))),
+          ? h("div", { class: "fx" }, h("h2", {}, `This ${R.noun} may already exist in BC`),
+              h("table", {}, h("thead", {}, h("tr", {}, ["No.", "Name", "City", "Why", ""].map(x => h("th", {}, x)))),
                 h("tbody", {}, matches.map(m => h("tr", {}, h("td", {}, m.number), h("td", { class: "wrap" }, m.displayName || ""),
                   h("td", {}, m.city || ""), h("td", {}, h("span", { class: "tag warn" }, m.why)),
                   h("td", {}, h("button", { type: "button", class: "small ghost", onclick: () => prepareLink(m) }, "Link…")))))))
-          : h("p", { class: "small" }, h("span", { class: "tag ok" }, "No match"), " No existing BC supplier with this name or registration number."));
+          : h("p", { class: "small" }, h("span", { class: "tag ok" }, "No match"), ` No existing BC ${R.noun} with this name` + (isSupplier ? " or registration number." : ".")));
       } catch (e) { dupBox.replaceChildren(h("p", { class: "muted small" }, "Duplicate check failed: " + e.message)); }
     }
 
@@ -1072,17 +1195,17 @@ function buildSupplierQueue() {
     async function prepareLink(m) {
       linkArea.replaceChildren(h("p", { class: "muted small" }, `Loading ${m.number} from BC...`));
       try {
-        const v = (await co(`/vendors?$filter=number eq '${m.number.replace(/'/g, "''")}'`)).value[0];
-        if (!v) throw new Error(`Vendor ${m.number} was not found in this company.`);
+        const v = (await co(`/${R.endpoint}?$filter=number eq '${odq(m.number)}'`)).value[0];
+        if (!v) throw new Error(`${m.number} was not found in this company.`);
         const diffs = [];
-        const cmp = (label, a, b) => { if (normName(a) !== normName(b)) diffs.push([label, a || "", b || ""]); };
+        const cmp = (label, a, b) => { if (a && normName(a) !== normName(b)) diffs.push([label, a || "", b || ""]); };
         cmp("Name", ctl.displayName.get(), v.displayName); cmp("Email", ctl.email.get(), v.email);
         cmp("Phone", ctl.phoneNumber.get(), v.phoneNumber); cmp("Address", ctl.addressLine1.get(), v.addressLine1);
         cmp("City", ctl.city.get(), v.city); cmp("Postal code", ctl.postalCode.get(), v.postalCode);
         cmp("Country", ctl.country.get(), v.country); cmp("Currency", ctl.currencyCode.get(), v.currencyCode);
-        if (hasBankExt) {
+        if (hasBankExt && ctl.bankAccountNo) {
           try {
-            const b = await bcFetch(extBase("vendorBanks") + `?$filter=vendorNumber eq '${m.number.replace(/'/g, "''")}'`);
+            const b = await bcFetch(extBase("vendorBanks") + `?$filter=vendorNumber eq '${odq(m.number)}'`);
             const acct = ctl.bankAccountNo.get();
             if (acct && !b.value.some(x => normName(x.bankAccountNo) === normName(acct)))
               diffs.push(["Bank account", acct, b.value.map(x => `${x.code}: ${x.bankAccountNo}`).join("; ") || "(none)"]);
@@ -1090,63 +1213,108 @@ function buildSupplierQueue() {
         }
         if (v.blocked && String(v.blocked).trim()) diffs.push(["Blocked", "", String(v.blocked)]);
         linkArea.replaceChildren(h("div", { class: "fx" },
-          h("h2", {}, `Link Asset ${g.assetId} to ${v.number} – ${v.displayName}`),
-          h("p", { class: "small" }, "Linking does not change anything in BC. It only records this vendor on the deal."),
+          h("h2", {}, `Link ${PARTY_SOURCES[g.source].label} ${g.ref} to ${v.number} – ${v.displayName}`),
+          h("p", { class: "small" }, "Linking does not change anything in BC. It only records this " + R.noun + " on the deal" + (isAsset ? "" : " and in the register, so later deals with the same name are auto-linked") + "."),
           diffs.length
-            ? h("div", {}, h("p", { class: "small" }, h("span", { class: "tag warn" }, "Differences"), " The deal and the BC vendor differ – update the vendor card in BC yourself if needed:"),
-                h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "Field"), h("th", {}, "Deal"), h("th", {}, "BC vendor"))),
+            ? h("div", {}, h("p", { class: "small" }, h("span", { class: "tag warn" }, "Differences"), ` The deal and the BC ${R.noun} differ – update the card in BC yourself if needed:`),
+                h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "Field"), h("th", {}, "Deal / form"), h("th", {}, "BC"))),
                   h("tbody", {}, diffs.map(([a, b, c]) => h("tr", {}, h("td", {}, a), h("td", { class: "wrap" }, b), h("td", { class: "wrap" }, c))))))
-            : h("p", { class: "small" }, h("span", { class: "tag ok" }, "Same"), " The deal details match the BC vendor."),
+            : h("p", { class: "small" }, h("span", { class: "tag ok" }, "Same"), " Nothing on the form differs from the BC card."),
           h("div", { class: "row-actions" },
             h("button", { type: "button", class: "ghost", onclick: () => linkArea.replaceChildren() }, "Cancel"),
             h("button", { type: "button", onclick: ev => doLink(v, ev.target) }, `Confirm link to ${v.number}`))));
-      } catch (e) { linkArea.replaceChildren(h("p", {}, "Could not load the vendor: " + e.message)); }
+      } catch (e) { linkArea.replaceChildren(h("p", {}, "Could not load the record: " + e.message)); }
     }
 
     // ----- reject -----
-    const rejectReason = h("input", { type: "text", placeholder: "Reason (required), e.g. wrong counterparty – deal is for ABC Holdings" });
+    const rejectReason = h("input", { type: "text", placeholder: "Reason (required), e.g. wrong counterparty name on the deal" });
     const rejectArea = h("div", { class: "fx hidden" }, h("h2", {}, "Reject"),
       h("label", {}, "Reason", rejectReason),
       h("div", { class: "row-actions" },
         h("button", { type: "button", class: "ghost", onclick: () => rejectArea.classList.add("hidden") }, "Cancel"),
         h("button", { type: "button", class: "danger", onclick: ev => doReject(ev.target) }, "Confirm reject")));
 
-    // ----- actions -----
+    // ----- claim / record the result (asset list columns, or the register) -----
     const me = account.username;
     const nowIso = () => new Date().toISOString();
     const staleMs = (queueSettings().staleCreatingMinutes || 15) * 60000;
+    const meIs = s => String(s || "").toLowerCase() === me.toLowerCase();
+    const recent = t => { const d = new Date(t); return !isNaN(d) && Date.now() - d < staleMs; };
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    const regVals = (status, no, reason) => ({
+      [RCOL.name]: g.company, Counterparty: g.company, [RCOL.source]: PARTY_SOURCES[g.source].label, [RCOL.role]: R.regRole, [RCOL.entity]: g.entity,
+      [RCOL.nameKey]: strictKey(g.company), [RCOL.no]: no || "", [RCOL.company]: companyName(), [RCOL.status]: status,
+      [RCOL.reviewedBy]: me, [RCOL.reviewedDate]: nowIso(), [RCOL.rejectReason]: reason || "", [RCOL.ref]: g.ref });
 
-    /* take the deal: refuses if someone else finished it or is busy with it */
-    async function claim(newStatus) {
-      const fresh = await spGetItem(p.id);
-      const st = fv(fresh, QCOL.status), by = fv(fresh, QCOL.reviewedBy);
-      if ([QSTATUS.created, QSTATUS.linked, QSTATUS.rejected].includes(st))
-        throw new Error(`Already ${st.toLowerCase()} by ${by || "someone"} – refresh the list.`);
-      if (st === QSTATUS.creating && by && by.toLowerCase() !== me.toLowerCase()) {
-        const t = new Date(fv(fresh, QCOL.reviewedDate));
-        if (!isNaN(t) && Date.now() - t < staleMs) throw new Error(`${by} is handling this deal right now (started ${t.toLocaleTimeString()}).`);
+    const handler = isAsset ? {
+      async claim() {
+        const ctx = p.ctx;
+        const fresh = await spGet(ctx, p.id);
+        const st = fv(fresh, QCOL.status), by = fv(fresh, QCOL.reviewedBy);
+        if ([QSTATUS.created, QSTATUS.linked, QSTATUS.rejected].includes(st)) throw new Error(`Already ${st.toLowerCase()} by ${by || "someone"} – refresh the list.`);
+        if (st === QSTATUS.creating && by && !meIs(by) && recent(fv(fresh, QCOL.reviewedDate))) throw new Error(`${by} is handling this deal right now.`);
+        try { await spWrite(ctx, p.id, { [QCOL.status]: QSTATUS.creating, [QCOL.reviewedBy]: me, [QCOL.reviewedDate]: nowIso(), [QCOL.company]: companyName() }, fresh.eTag); }
+        catch (e) { if (e.status === 412) throw new Error("Someone else just started on this deal – refresh the list."); throw e; }
+        await sleep(1200);
+        const check = await spGet(ctx, p.id);
+        if (!meIs(fv(check, QCOL.reviewedBy))) throw new Error(`${fv(check, QCOL.reviewedBy)} started on this deal at the same moment – refresh the list.`);
+        return { number: fv(fresh, QCOL.vendorNo), wasInterrupted: st === QSTATUS.creating };
+      },
+      saveNumber: no => spWrite(p.ctx, p.id, { [QCOL.vendorNo]: no }),
+      async finish(status, no, reason) {
+        const vals = { [QCOL.status]: status, [QCOL.vendorNo]: no || "", [QCOL.company]: companyName(),
+                       [QCOL.reviewedBy]: me, [QCOL.reviewedDate]: nowIso(), [QCOL.rejectReason]: reason || "" };
+        const failed = [];
+        for (const it of g.items) { try { await spWrite(it.ctx, it.id, vals); } catch (e) { failed.push(`item ${it.id}: ${e.message}`); } }
+        if (failed.length) throw new Error("Could not update every list item: " + failed.join("; ") + " – click the action again to retry.");
+        if (status !== QSTATUS.rejected) {   // let later RECs / CC deals with this name auto-link (best effort)
+          try { await spCreate(await regList(), regVals(status, no, "")); }
+          catch (e) { return `not added to the register (${e.message})`; }
+        }
       }
-      try { await spWrite(p.id, { [QCOL.status]: newStatus, [QCOL.reviewedBy]: me, [QCOL.reviewedDate]: nowIso(), [QCOL.company]: companyName() }, fresh.eTag); }
-      catch (e) { if (e.status === 412) throw new Error("Someone else just started on this deal – refresh the list."); throw e; }
-      await new Promise(r => setTimeout(r, 1200));
-      const check = await spGetItem(p.id);
-      if (fv(check, QCOL.reviewedBy).toLowerCase() !== me.toLowerCase()) throw new Error(`${fv(check, QCOL.reviewedBy)} started on this deal at the same moment – refresh the list.`);
-      return fresh;   // the state before we claimed it (holds the number of an interrupted attempt)
-    }
-    async function finish(status, vendorNo, reason) {
-      const vals = { [QCOL.status]: status, [QCOL.vendorNo]: vendorNo || "", [QCOL.company]: companyName(),
-                     [QCOL.reviewedBy]: me, [QCOL.reviewedDate]: nowIso(), [QCOL.rejectReason]: reason || "" };
-      const failed = [];
-      for (const it of g.items) { try { await spWrite(it.id, vals); } catch (e) { failed.push(`item ${it.id}: ${e.message}`); } }
-      if (failed.length) throw new Error("Could not update every list item: " + failed.join("; ") + " – click the action again to retry.");
-    }
-    function lock(btn, on) { actionBtns.forEach(b => b.disabled = on); if (btn) btn.disabled = on; }
+    } : (() => {
+      let rowId = null;
+      return {
+        async claim() {
+          const ctx = await regList();
+          const rows = await spItems(ctx);
+          const k = strictKey(g.company);
+          const same = rows.filter(r => fv(r, RCOL.role) === R.regRole && fv(r, RCOL.entity).toUpperCase() === g.entity);
+          const named = same.find(r => k && fv(r, RCOL.nameKey) === k && [QSTATUS.created, QSTATUS.linked].includes(fv(r, RCOL.status)));
+          if (named) throw new Error(`${g.company} was already ${fv(named, RCOL.status).toLowerCase()} as ${fv(named, RCOL.no)} by ${fv(named, RCOL.reviewedBy)} – refresh the list.`);
+          const own = same.filter(r => fv(r, RCOL.ref) === g.ref && fv(r, RCOL.source) === PARTY_SOURCES[g.source].label);
+          const ownRej = own.find(r => fv(r, RCOL.status) === QSTATUS.rejected);
+          if (ownRej) throw new Error(`Already rejected by ${fv(ownRej, RCOL.reviewedBy)} – refresh the list.`);
+          const busy = same.find(r => fv(r, RCOL.status) === QSTATUS.creating && !meIs(fv(r, RCOL.reviewedBy)) && recent(fv(r, RCOL.reviewedDate)) &&
+                                      (fv(r, RCOL.ref) === g.ref || (k && fv(r, RCOL.nameKey) === k)));
+          if (busy) throw new Error(`${fv(busy, RCOL.reviewedBy)} is handling ${g.company} right now.`);
+          const mine = own.find(r => fv(r, RCOL.status) === QSTATUS.creating);
+          if (mine) {   // continue an interrupted attempt (ours, or someone else's that went stale)
+            rowId = mine.id;
+            await spWrite(ctx, rowId, { [RCOL.reviewedBy]: me, [RCOL.reviewedDate]: nowIso(), [RCOL.company]: companyName() });
+            return { number: fv(mine, RCOL.no), wasInterrupted: true };
+          }
+          const created = await spCreate(ctx, regVals(QSTATUS.creating, "", ""));
+          rowId = created.id;
+          await sleep(1200);
+          const again = await spItems(ctx);
+          const rival = again.find(r => r.id !== rowId && Number(r.id) < Number(rowId) && fv(r, RCOL.status) === QSTATUS.creating &&
+            fv(r, RCOL.role) === R.regRole && fv(r, RCOL.entity).toUpperCase() === g.entity && !meIs(fv(r, RCOL.reviewedBy)) &&
+            (fv(r, RCOL.ref) === g.ref || (k && fv(r, RCOL.nameKey) === k)));
+          if (rival) { try { await spDelete(ctx, rowId); } catch {} rowId = null; throw new Error(`${fv(rival, RCOL.reviewedBy)} started on ${g.company} at the same moment – refresh the list.`); }
+          return { number: "", wasInterrupted: false };
+        },
+        saveNumber: async no => spWrite(await regList(), rowId, { [RCOL.no]: no }),
+        async finish(status, no, reason) { await spWrite(await regList(), rowId, regVals(status, no, reason)); }
+      };
+    })();
 
+    function lock(on) { actionBtns.forEach(b => b.disabled = on); }
     function validate() {
       for (const [k, c] of Object.entries(ctl)) {
-        const v = c.get();
-        if (c.o.ext && !hasVendorExt) continue;
+        if (c.o.ext && !hasExt) continue;
         if (k === "bankCode" && !hasBankExt) continue;
+        const v = c.get();
         if (c.o.required && !v) throw new Error(`Please fill in ${c.label}.`);
         if (c.o.max && v.length > c.o.max) throw new Error(`${c.label} is ${v.length} characters; BC allows ${c.o.max}.`);
       }
@@ -1155,152 +1323,162 @@ function buildSupplierQueue() {
       if (bad.length) throw new Error("Email not valid: " + bad.join(", "));
       if (hasBankExt && ctl.bankAccountNo.get() && !ctl.bankCode.get()) throw new Error("Please fill in the bank account code.");
     }
+    function cardBody() {
+      const body = { displayName: ctl.displayName.get() };
+      for (const k of ["email", "phoneNumber", "addressLine1", "addressLine2", "city", "postalCode", "country", "currencyCode"]) {
+        let v = ctl[k].get(); if (k === "email") v = v.split(";").map(x => x.trim()).filter(Boolean).join(";");
+        if (v) body[k] = v;
+      }
+      return body;
+    }
+    async function findByNumber(no) { return (await co(`/${R.endpoint}?$filter=number eq '${odq(no)}'`)).value[0]; }
+    function done(msg, kind) { setStatus(msg, kind); clearCache(R.lookup); closeReview(); }
 
-    async function doCreate(btn) {
+    async function doCreate() {
       try { validate(); } catch (e) { setStatus(e.message, "err"); return; }
-      if (matches.length && !confirm(`BC may already have this supplier (${matches.map(m => m.number).join(", ")}). Create a NEW vendor anyway?`)) return;
-      lock(btn, true);
+      if (matches.length && !confirm(`BC may already have this ${R.noun} (${matches.map(m => m.number).join(", ")}). Create a NEW one anyway?`)) return;
+      lock(true);
       const notes = [];
       try {
-        setStatus(`Taking Asset ${g.assetId}...`);
-        const before = await claim(QSTATUS.creating);
-        // 1. vendor number – reuse the one an interrupted attempt already took
-        let number = fv(before, QCOL.vendorNo);
-        if (!number) {
-          setStatus(`Taking the next number from ${series}...`);
-          number = await nextNumberFrom(series);
-          await spWrite(p.id, { [QCOL.vendorNo]: number });
+        setStatus(`Taking ${g.ref}...`);
+        const claimed = await handler.claim();
+        let number = claimed.number, rec = number ? await findByNumber(number) : null;
+        const body = cardBody();
+        const pt = ctl.paymentTerms.get();
+        if (pt) {
+          const t = (await paymentTermsLookup()).find(x => String(x.code).toUpperCase() === pt.toUpperCase());
+          if (t) body.paymentTermsId = t.id; else notes.push(`payment terms ${pt} does not exist in this company – set it in BC`);
         }
-        // 2. vendor card (skip if an interrupted attempt already created it)
-        let rec = (await co(`/vendors?$filter=number eq '${number.replace(/'/g, "''")}'`)).value[0];
-        if (!rec) {
-          setStatus(`Creating supplier ${number}...`);
-          const body = { number, displayName: ctl.displayName.get() };
-          for (const k of ["email", "phoneNumber", "addressLine1", "addressLine2", "city", "postalCode", "country", "currencyCode"]) {
-            let v = ctl[k].get(); if (k === "email") v = v.split(";").map(x => x.trim()).filter(Boolean).join(";");
-            if (v) body[k] = v;
-          }
-          const pt = ctl.paymentTerms.get();
-          if (pt) {
-            const t = (await paymentTermsLookup()).find(x => String(x.code).toUpperCase() === pt.toUpperCase());
-            if (t) body.paymentTermsId = t.id; else notes.push(`payment terms ${pt} does not exist in this company – set it in BC`);
-          }
-          rec = await co(`/vendors`, { method: "POST", body: JSON.stringify(body) });
-        } else notes.push(`vendor ${number} already existed from an earlier attempt – reused it`);
-        // 3. posting groups, registration number, MyInvois (extension v1.4)
-        if (hasVendorExt) {
+        if (isSupplier) {
+          // vendor number from the fixed series – an interrupted attempt's number is reused
+          if (!number) { setStatus(`Taking the next number from ${series}...`); number = await nextNumberFrom(series); await handler.saveNumber(number); }
+          if (!rec) rec = await findByNumber(number);
+          if (!rec) { setStatus(`Creating supplier ${number}...`); rec = await co(`/vendors`, { method: "POST", body: JSON.stringify({ number, ...body }) }); }
+          else notes.push(`${number} already existed from an earlier attempt – reused it`);
+        } else {
+          if (!rec) {
+            if (claimed.wasInterrupted) {   // BC numbers customers itself: make sure an interrupted attempt did not already create one
+              const twin = (await lookups.customers()).find(c => normName(c.displayName) === normName(body.displayName));
+              if (twin) throw new Error(`A customer named ${twin.displayName} already exists (${twin.number}) – probably from the interrupted attempt. Use Link… on it instead.`);
+            }
+            setStatus("Creating customer...");
+            rec = await co(`/customers`, { method: "POST", body: JSON.stringify(body) });
+            number = rec.number;
+            await handler.saveNumber(number);
+          } else notes.push(`${number} already existed from an earlier attempt – reused it`);
+        }
+        // posting groups / registration / MyInvois (Saxon Portal API: vendors v1.4, customers v1.3)
+        if (hasExt) {
           setStatus(`Created ${number}. Setting posting groups...`);
+          const keys = isSupplier ? ["genBusPostingGroup", "vendorPostingGroup", "vatBusPostingGroup", "registrationNumber"] : ["genBusPostingGroup", "customerPostingGroup"];
           const ext = {};
-          for (const k of ["genBusPostingGroup", "vendorPostingGroup", "vatBusPostingGroup", "registrationNumber"].concat(myInvois ? ["taxIdentificationNo", "idType", "idNo"] : [])) {
-            const v = ctl[k].get(); if (v) ext[k] = v;
-          }
-          try { await bcFetch(`${extBase("vendors")}(${rec.id})`, { method: "PATCH", headers: { "If-Match": "*" }, body: JSON.stringify(ext) }); }
-          catch (e) { notes.push(`posting groups / registration / MyInvois NOT set (${e.message})`); }
-        } else notes.push("posting groups and registration number not set – Saxon Portal API v1.4 is not installed");
-        // 4. bank account (extension v1.4)
-        const acct = ctl.bankAccountNo.get();
+          for (const k of keys.concat(myInvois ? ["taxIdentificationNo", "idType", "idNo"] : [])) { const v = ctl[k] && ctl[k].get(); if (v) ext[k] = v; }
+          if (!ext.idNo) delete ext.idType;   // ID Type only together with an ID No.
+          try { await bcFetch(`${extBase(extKind)}(${rec.id})`, { method: "PATCH", headers: { "If-Match": "*" }, body: JSON.stringify(ext) }); }
+          catch (e) { notes.push(`posting groups / MyInvois NOT set (${e.message})`); }
+        } else notes.push(`posting groups not set – Saxon Portal API ${isSupplier ? "v1.4" : "v1.3"} is not installed`);
+        // bank account (suppliers, v1.4)
+        const acct = isSupplier ? ctl.bankAccountNo.get() : "";
         if (acct && hasBankExt) {
           setStatus(`Adding bank account to ${number}...`);
           try {
             const code = ctl.bankCode.get();
-            const existing = await bcFetch(extBase("vendorBanks") + `?$filter=vendorNumber eq '${number.replace(/'/g, "''")}' and code eq '${code.replace(/'/g, "''")}'`);
+            const existing = await bcFetch(extBase("vendorBanks") + `?$filter=vendorNumber eq '${odq(number)}' and code eq '${odq(code)}'`);
             if (!existing.value.length)
               await bcFetch(extBase("vendorBanks"), { method: "POST", body: JSON.stringify({ vendorNumber: number, code, name: ctl.bankName.get(),
                 bankAccountNo: acct, swiftCode: ctl.swiftCode.get(), currencyCode: ctl.currencyCode.get(), setAsPreferred: true }) });
           } catch (e) { notes.push(`bank account NOT added (${e.message})`); }
         } else if (acct) notes.push("bank details not added – Saxon Portal API v1.4 is not installed, copy them into BC");
-        // 5. record the result on every list item of the deal
-        setStatus(`Recording ${number} on the SharePoint list...`);
-        await finish(QSTATUS.created, number, "");
-        clearCache("vendors");
-        setStatus(`Created supplier ${number} – ${rec.displayName} for Asset ${g.assetId}.` + (notes.length ? " Note: " + notes.join("; ") + "." : ""), notes.length ? "warn" : "ok");
-        reviewBox.replaceChildren(); openKey = null;
-        refresh();
+        setStatus(`Recording ${number}...`);
+        const n = await handler.finish(QSTATUS.created, number, "");
+        if (n) notes.push(n);
+        done(`Created ${R.noun} ${number} – ${rec.displayName} for ${PARTY_SOURCES[g.source].label} ${g.ref}.` + (notes.length ? " Note: " + notes.join("; ") + "." : ""), notes.length ? "warn" : "ok");
       } catch (e) {
         setStatus("Error: " + e.message + " – the deal stays in Pending; open it and click Create again to continue where it stopped.", "err");
         refresh();
-      } finally { lock(btn, false); }
+      } finally { lock(false); }
     }
 
-    async function doLink(v, btn) {
-      lock(btn, true);
+    async function doLink(v) {
+      lock(true);
       try {
-        setStatus(`Linking Asset ${g.assetId} to ${v.number}...`);
-        const before = await claim(QSTATUS.creating);
-        if (fv(before, QCOL.vendorNo) && fv(before, QCOL.vendorNo) !== v.number)
-          throw new Error(`An earlier Create already took number ${fv(before, QCOL.vendorNo)} for this deal. Click Create to finish that instead, or clear "BC Vendor No." on the list item first.`);
-        await finish(QSTATUS.linked, v.number, "");
-        setStatus(`Asset ${g.assetId} linked to ${v.number} – ${v.displayName}.`, "ok");
-        reviewBox.replaceChildren(); openKey = null;
-        refresh();
+        setStatus(`Linking ${g.ref} to ${v.number}...`);
+        const claimed = await handler.claim();
+        if (claimed.number && claimed.number !== v.number)
+          throw new Error(`An earlier Create already took number ${claimed.number} for this deal. Click Create to finish that instead.`);
+        const n = await handler.finish(QSTATUS.linked, v.number, "");
+        done(`${PARTY_SOURCES[g.source].label} ${g.ref} linked to ${v.number} – ${v.displayName}.` + (n ? " Note: " + n + "." : ""), n ? "warn" : "ok");
       } catch (e) { setStatus("Error: " + e.message, "err"); }
-      finally { lock(btn, false); }
+      finally { lock(false); }
     }
 
-    async function doReject(btn) {
+    async function doReject() {
       const reason = rejectReason.value.trim();
       if (!reason) { setStatus("Please give a reason for the rejection.", "err"); rejectReason.focus(); return; }
-      lock(btn, true);
+      lock(true);
       try {
-        const before = await claim(QSTATUS.creating);
-        if (fv(before, QCOL.vendorNo)) throw new Error(`An earlier Create already took number ${fv(before, QCOL.vendorNo)} for this deal – finish or clean that up in BC before rejecting.`);
-        await finish(QSTATUS.rejected, "", reason);
-        setStatus(`Asset ${g.assetId} rejected.`, "ok");
-        reviewBox.replaceChildren(); openKey = null;
-        refresh();
+        const claimed = await handler.claim();
+        if (claimed.number) throw new Error(`An earlier Create already took number ${claimed.number} for this deal – finish or clean that up in BC before rejecting.`);
+        await handler.finish(QSTATUS.rejected, "", reason);
+        done(`${PARTY_SOURCES[g.source].label} ${g.ref} rejected.`, "ok");
       } catch (e) { setStatus("Error: " + e.message, "err"); }
-      finally { lock(btn, false); }
+      finally { lock(false); }
     }
 
-    const createBtn = h("button", { type: "button", onclick: ev => doCreate(ev.target) }, g.status === QSTATUS.creating ? "Continue create" : "Create supplier in BC");
+    const createBtn = h("button", { type: "button", onclick: () => doCreate() }, g.status === QSTATUS.creating ? "Continue create" : `Create ${R.noun} in BC`);
     const rejectBtn = h("button", { type: "button", class: "danger", onclick: () => { rejectArea.classList.remove("hidden"); rejectReason.focus(); } }, "Reject…");
     const actionBtns = [createBtn, rejectBtn];
 
     ctl.displayName.el.addEventListener("change", runDupCheck);
-    ctl.registrationNumber.el.addEventListener("change", runDupCheck);
+    if (ctl.registrationNumber) ctl.registrationNumber.el.addEventListener("change", runDupCheck);
     runDupCheck();
 
-    const agreementUrl = fv(p, "Agreement File URL");
+    const by = isAsset ? fv(p, QCOL.reviewedBy) : g.regRow ? fv(g.regRow, RCOL.reviewedBy) : "";
+    const takenNo = isAsset ? fv(p, QCOL.vendorNo) : g.regRow ? fv(g.regRow, RCOL.no) : "";
     const interrupted = g.status === QSTATUS.creating
       ? h("p", { class: "small" }, h("span", { class: "tag warn" }, "Interrupted"),
-          ` ${fv(p, QCOL.reviewedBy) || "Someone"} started creating this supplier` + (fv(p, QCOL.vendorNo) ? ` and took number ${fv(p, QCOL.vendorNo)}` : "") + " but it did not finish. Create will continue with the same number.")
+          ` ${by || "Someone"} started creating this ${R.noun}` + (takenNo ? ` and got number ${takenNo}` : "") + " but it did not finish. Create will continue" + (takenNo ? " with the same number." : "."))
       : "";
-    const addrNotes = addr.notes.map(n => h("p", { class: "small" }, h("span", { class: "tag warn" }, "Check"), " ", n));
+    const meta = isAsset
+      ? `${g.typeLabel} · Entity ${g.entity} → ${companyName()} · approved by ${fv(p, "Approved By")} on ${fmtDate(g.approvedTime)} · BD ${fv(p, "Title")} · ${g.items.length} product(s)`
+      : `${PARTY_SOURCES[g.source].label} · ${g.typeLabel} · Entity ${g.entity} → ${companyName()} · approved by ${fv(p, "Approved By")} on ${fmtDate(g.approvedTime)} · Sales PIC ${fv(p, "Title")} · ${g.items.length} trade(s)` +
+        (fv(p, "Registry") ? ` · ${fv(p, "Registry")}` : "");
+    const agreementUrl = fv(p, "Agreement File URL");
 
     return h("div", { class: "card" },
       h("div", { class: "card-head" },
-        h("h2", {}, `Asset ${g.assetId} – ${g.company}`),
+        h("h2", {}, `${PARTY_SOURCES[g.source].label} ${g.ref} – ${g.company}`),
         h("button", { type: "button", class: "small ghost", onclick: () => { reviewBox.replaceChildren(); openKey = null; draw(); } }, "Close")),
-      h("p", { class: "muted small", style: "margin-top:-.4rem" },
-        `${fv(p, "Agreement Type")} · Entity ${g.entity} → ${companyName()} · approved by ${fv(p, "Approved By")} on ${fmtDate(g.approvedTime)} · BD ${fv(p, "Title")} · ${g.items.length} product(s)`,
+      h("p", { class: "muted small", style: "margin-top:-.4rem" }, meta,
         agreementUrl ? [" · ", h("a", { href: agreementUrl, target: "_blank", rel: "noopener" }, "Agreement file")] : ""),
       interrupted,
+      isAsset ? "" : h("p", { class: "small" }, h("span", { class: "tag" }, "Note"),
+        ` The ${PARTY_SOURCES[g.source].label} deal only gives the ${isSupplier ? "seller" : "buyer"} name, currency and payment term – fill in the rest before creating. Once created or linked, later deals for “${g.company}” (${g.entity}) are linked automatically.`),
       dupBox, linkArea,
-      h("div", { class: "sub" }, "Original invoice address on the deal"),
-      h("div", { class: "party-info", style: "white-space:pre-line" }, fv(p, "Invoice Address") || "(blank)"),
-      ...addrNotes,
-      h("div", { class: "sub" }, "Supplier card"), vendorFields,
-      hasVendorExt
-        ? [h("div", { class: "sub" }, "Posting groups & registration"), extFields]
-        : h("p", { class: "small" }, h("span", { class: "tag warn" }, "v1.4 not installed"), " Posting groups, registration number and MyInvois fields will not be set – fill them in BC after creating."),
-      h("div", { class: "sub" }, hasBankExt ? "Bank account (added to BC and set as preferred)" : "Bank details (copy into BC by hand – Saxon Portal API v1.4 is not installed)"),
-      bankFields,
+      isAsset ? [h("div", { class: "sub" }, "Original invoice address on the deal"),
+                 h("div", { class: "party-info", style: "white-space:pre-line" }, fv(p, "Invoice Address") || "(blank)"),
+                 ...addr.notes.map(n => h("p", { class: "small" }, h("span", { class: "tag warn" }, "Check"), " ", n))] : "",
+      h("div", { class: "sub" }, isSupplier ? "Supplier card" : "Customer card"), cardFields,
+      hasExt
+        ? [h("div", { class: "sub" }, isSupplier ? "Posting groups & registration" : "Posting groups" + (myInvois ? " & MyInvois" : "")), extFields]
+        : h("p", { class: "small" }, h("span", { class: "tag warn" }, `${isSupplier ? "v1.4" : "v1.3"} not installed`), " Posting groups and MyInvois fields will not be set – fill them in BC after creating."),
+      isSupplier ? [h("div", { class: "sub" }, hasBankExt ? "Bank account (added to BC and set as preferred)" : "Bank details (copy into BC by hand – Saxon Portal API v1.4 is not installed)"), bankFields] : "",
       rejectArea,
       h("div", { class: "row-actions" }, createBtn, rejectBtn,
-        h("span", { class: "muted small" }, `Company: ${companyName()} · number from ${series}`)));
+        h("span", { class: "muted small" }, `Company: ${companyName()}` + (isSupplier ? ` · number from ${series}` : ""))));
   }
 
   return h("div", {},
     h("div", { class: "card" },
-      h("div", { class: "card-head" }, h("h2", {}, "Suppliers from approved asset deals"),
+      h("div", { class: "card-head" }, h("h2", {}, R.title),
         h("div", { class: "row-actions", style: "margin:0" }, btnPending, btnDone, filter,
           h("button", { type: "button", class: "small ghost", onclick: refresh }, "Refresh"))),
       note, listBox),
     reviewBox);
 }
-function setTabBadge(n) {
-  const b = document.querySelector('#tabs button[data-tab="supplierQueue"]');
-  if (b) b.textContent = "Pending suppliers" + (n ? ` (${n})` : "");
+function setTabBadge(R, n) {
+  const b = document.querySelector(`#tabs button[data-tab="${R.tab}"]`);
+  if (b) b.textContent = R.tabLabel + (n ? ` (${n})` : "");
 }
 
 /* ---------- inventory tab ---------- */
@@ -2261,7 +2439,7 @@ function showTab(id) {
   if (!TABS.some(t => t.id === id)) id = TABS[0].id;
   document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === id));
   document.querySelectorAll("#panels > div").forEach(p => p.classList.toggle("hidden", p.dataset.tab !== id));
-  if ((!loaded[id] || id === "inventory" || id === "approvals" || id === "supplierQueue") && refreshers[id]) { loaded[id] = true; refreshers[id](); }
+  if ((!loaded[id] || id === "inventory" || id === "approvals" || id === "supplierQueue" || id === "customerQueue") && refreshers[id]) { loaded[id] = true; refreshers[id](); }
 }
 function buildUI(activeId) {
   Object.keys(loaded).forEach(k => delete loaded[k]);

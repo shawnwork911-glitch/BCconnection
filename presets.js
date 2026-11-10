@@ -71,12 +71,15 @@ window.PORTAL_PRESETS = {
       { code: "IC-T-SAXONSG",  desc: "Interco Trade Receivables - Saxon Renewables Pte Ltd" },
       { code: "NON-TRADE",     desc: "Non-Trade Receivables" },
       { code: "TRADE",         desc: "Trade Receivables" } ],
-    idTypes: [ { code: "NRIC" }, { code: "PASSPORT" }, { code: "BRN" }, { code: "Army" } ]
+    idTypes: [ { code: "NRIC" }, { code: "PASSPORT" }, { code: "BRN" }, { code: "Army" } ],
+    // Pending customers tab (buyers on RECs / Carbon Credit Stock-Out deals): starting values on the review form.
+    // LOCAL when the customer's country = the company's (MY / SG), otherwise OVERSEAS.
+    defaults: { genBusLocal: "LOCAL", genBusOverseas: "OVERSEAS", customerPostingGroup: "TRADE", idType: "BRN" }
   },
 
-  // Pending suppliers tab (suppliers from approved asset deals).
+  // Pending suppliers / customers tabs (asset deals, and RECs / Carbon Credit deals).
   //   since:  deals approved BEFORE this date are not listed (set to the go-live date)
-  //   noSeries: every asset supplier takes its number from this series (fixed)
+  //   noSeries: every deal supplier takes its number from this series (fixed); customers use BC's default
   //   staleCreatingMinutes: after this long, someone else may continue an interrupted Create
   supplierQueue: { since: "2026-11-10", noSeries: "PP-VENNO1", staleCreatingMinutes: 15 },
 
