@@ -40,9 +40,6 @@
   th { background:#f0f3f6; }
   td.num { text-align:right; }
   td.low { color:var(--danger); font-weight:600; }
-  .inv-sum { display:flex; flex-wrap:wrap; gap:1.5rem; margin-top:.9rem; padding:.7rem .9rem; background:#f7f9fb; border:1px solid var(--line); border-radius:6px; }
-  .inv-sum-lbl { font-size:.75rem; color:var(--muted); }
-  .inv-sum-val { font-size:1.3rem; font-weight:600; color:var(--accent); font-variant-numeric:tabular-nums; }
   td.wrap { white-space:normal; min-width:180px; max-width:280px; }
   table.lines td { padding:.25rem .4rem; }
   table.lines input { margin:0; padding:.35rem .45rem; }
@@ -127,7 +124,17 @@ const CONFIG = {
   // Saxon Portal API extension (sets VAT Bus. Posting Group on PO lines).
   // Leave publisher blank to switch it off.
   lineExtApi: { publisher: "saxon", group: "portal", version: "v1.0",
-                entities: { po: "purchaseLineExts", so: "salesLineExts", customers: "customerExts" } },
+                entities: { po: "purchaseLineExts", so: "salesLineExts", customers: "customerExts",
+                            vendors: "vendorExts", vendorBanks: "vendorBankAccounts" } },   // vendor pages: v1.4
+
+  // Pending suppliers tab: reads the SharePoint list Trade Confirmation writes at Level 3 approval.
+  // Needs the delegated Graph permission Sites.ReadWrite.All on this app registration.
+  graph: {
+    scopes: ["https://graph.microsoft.com/Sites.ReadWrite.All"],
+    siteHost: "saxonrenewables.sharepoint.com",
+    sitePath: "/sites/Operations",
+    assetListId: "8c4f2f44-4662-4c4e-a56b-312772142c0d"   // Asset Approval Record List
+  },
 
   // Approvals need their own custom API page (only used if features.approvals = true).
   approvalApi: {
@@ -453,6 +460,7 @@ const ORDERS = {
 const TABS = [
   { id: "items",     label: "Part Number", build: () => buildMaster("items") },
   { id: "vendors",   label: "Supplier",    build: () => buildMaster("vendors") },
+  { id: "supplierQueue", label: "Pending suppliers", build: () => buildSupplierQueue() },
   { id: "customers", label: "Customer",    build: () => buildMaster("customers") },
   { id: "inventory", label: "Inventory",   build: () => buildInventory() },
   { id: "po",        label: "Purchase Order", build: () => buildOrder("po") },
@@ -657,73 +665,676 @@ function buildMaster(key) {
   );
 }
 
+/* =====================================================================
+   PENDING SUPPLIERS tab
+   Asset deals approved at Level 3 in Trade Confirmation are written to the
+   SharePoint list "Asset Approval Record List" (one item per product).
+   This tab reads that list, groups the items by Asset ID, and lets the
+   reviewer Create the supplier in BC, Link it to an existing vendor, or
+   Reject it. The result is written back to the BC* columns on every list
+   item of the deal. Nothing is emailed from here.
+   ===================================================================== */
+
+/* ---------- Microsoft Graph (SharePoint list) ---------- */
+async function getGraphToken() {
+  const req = { scopes: CONFIG.graph.scopes, account };
+  try {
+    return (await msalApp.acquireTokenSilent(req)).accessToken;
+  } catch (e) {
+    // first use: the user (or an admin) must consent to the SharePoint permission
+    try { return (await msalApp.acquireTokenPopup(req)).accessToken; }
+    catch (e2) {
+      if (/popup/i.test(e2.message || "")) { await msalApp.acquireTokenRedirect(req); throw new Error("Re-authenticating..."); }
+      throw new Error("SharePoint sign-in failed: " + (e2.message || e2));
+    }
+  }
+}
+async function graphFetch(path, options = {}) {
+  const token = await getGraphToken();
+  const res = await fetch(path.startsWith("http") ? path : "https://graph.microsoft.com/v1.0" + path, {
+    ...options,
+    headers: { "Authorization": "Bearer " + token, "Accept": "application/json", "Content-Type": "application/json", ...(options.headers || {}) }
+  });
+  if (!res.ok) {
+    const err = new Error(`SharePoint ${res.status}: ${niceError(await res.text())}`);
+    err.status = res.status; throw err;
+  }
+  return res.status === 204 ? null : res.json();
+}
+
+/* BC* columns this tab writes. Display names as created in the list (see setup checklist). */
+const QCOL = {
+  status: "BC Supplier Status", vendorNo: "BC Vendor No.", company: "BC Company",
+  reviewedBy: "BC Reviewed By", reviewedDate: "BC Reviewed Date", rejectReason: "BC Reject Reason"
+};
+const QSTATUS = { pending: "Pending", creating: "Creating", created: "Created", linked: "Linked", rejected: "Rejected" };
+
+let spCtx = null;   // { siteId, listId, col: displayName -> internal name }
+async function spContext() {
+  if (spCtx) return spCtx;
+  const g = CONFIG.graph;
+  const site = await graphFetch(`/sites/${g.siteHost}:${g.sitePath}?$select=id`);
+  const cols = await graphFetch(`/sites/${site.id}/lists/${g.assetListId}/columns?$select=name,displayName`);
+  const col = {};
+  cols.value.forEach(c => { col[c.displayName] = c.name; });
+  const missing = Object.values(QCOL).filter(d => !col[d]);
+  if (missing.length) throw new Error(`The Asset Approval Record List is missing these columns: ${missing.join(", ")}. Add them in SharePoint (see the setup checklist), then click Refresh.`);
+  spCtx = { siteId: site.id, listId: g.assetListId, col };
+  return spCtx;
+}
+function itemUrl(ctx, id) { return `/sites/${ctx.siteId}/lists/${ctx.listId}/items/${id}`; }
+async function spAllItems() {
+  const ctx = await spContext();
+  const out = [];
+  let url = `/sites/${ctx.siteId}/lists/${ctx.listId}/items?$expand=fields&$top=500`;
+  while (url) {
+    const d = await graphFetch(url);
+    out.push(...d.value.map(i => ({ id: i.id, eTag: i.eTag, f: i.fields || {} })));
+    url = d["@odata.nextLink"];
+  }
+  return out;
+}
+async function spGetItem(id) {
+  const ctx = await spContext();
+  const i = await graphFetch(itemUrl(ctx, id) + "?$expand=fields");
+  return { id: i.id, eTag: i.eTag, f: i.fields || {} };
+}
+/* write { displayName: value } to one list item; If-Match makes it fail with 412 when someone changed it first */
+async function spWrite(id, byDisplayName, eTag) {
+  const ctx = await spContext();
+  const body = {};
+  for (const [d, v] of Object.entries(byDisplayName)) if (ctx.col[d]) body[ctx.col[d]] = v;
+  return graphFetch(itemUrl(ctx, id) + "/fields", { method: "PATCH", headers: eTag ? { "If-Match": eTag } : {}, body: JSON.stringify(body) });
+}
+function fv(item, displayName) {
+  const name = spCtx && spCtx.col[displayName];
+  const v = name ? item.f[name] : undefined;
+  return v == null ? "" : String(v).trim();
+}
+
+/* ---------- prefill helpers ---------- */
+const COUNTRY_NAMES = { MALAYSIA: "MY", SINGAPORE: "SG", INDONESIA: "ID", VIETNAM: "VN", "VIET NAM": "VN", THAILAND: "TH",
+  PHILIPPINES: "PH", CHINA: "CN", "HONG KONG": "HK", TAIWAN: "TW", JAPAN: "JP", KOREA: "KR", INDIA: "IN", AUSTRALIA: "AU",
+  "UNITED KINGDOM": "GB", "UNITED STATES": "US", USA: "US" };
+const MY_STATES = /^(JOHOR|KEDAH|KELANTAN|MELAKA|MALACCA|NEGERI SEMBILAN|PAHANG|PERAK|PERLIS|PULAU PINANG|PENANG|SABAH|SARAWAK|SELANGOR|TERENGGANU|WILAYAH PERSEKUTUAN.*|W\.?P\.?.*|KUALA LUMPUR|PUTRAJAYA|LABUAN)$/i;
+
+/* "Lot 1, Jalan X\n50450 Kuala Lumpur, Wilayah Persekutuan\nMalaysia" -> BC address fields */
+function splitAddress(text) {
+  const out = { addressLine1: "", addressLine2: "", city: "", postalCode: "", country: "", notes: [] };
+  let parts = String(text || "").split(/\r?\n/).map(s => s.trim().replace(/,$/, "").trim()).filter(Boolean);
+  const oneLine = parts.length === 1;
+  if (oneLine) parts = parts[0].split(/,\s*/).map(s => s.trim()).filter(Boolean);
+  if (!parts.length) return out;
+  // trailing country name
+  const last = parts[parts.length - 1].toUpperCase().replace(/\.$/, "");
+  if (COUNTRY_NAMES[last]) { out.country = COUNTRY_NAMES[last]; parts.pop(); }
+  // the part holding a 5 or 6 digit postcode gives postcode + city
+  let pcIdx = -1;
+  for (let i = parts.length - 1; i >= 0; i--) if (/\b\d{5,6}\b/.test(parts[i])) { pcIdx = i; break; }
+  if (pcIdx >= 0) {
+    const p = parts[pcIdx];
+    const m = p.match(/\b(\d{5,6})\b/);
+    out.postalCode = m[1];
+    if (m[1].length === 6 && !out.country) out.country = "SG";
+    let rest = p.replace(m[0], " ").replace(/\s{2,}/g, " ").replace(/^[\s,]+|[\s,]+$/g, "");
+    let cityBits = rest.split(/,\s*/).filter(Boolean);
+    // trailing state / country words are not the city
+    while (cityBits.length > 1 && (MY_STATES.test(cityBits[cityBits.length - 1]) || COUNTRY_NAMES[cityBits[cityBits.length - 1].toUpperCase()])) {
+      const w = cityBits.pop().toUpperCase();
+      if (COUNTRY_NAMES[w] && !out.country) out.country = COUNTRY_NAMES[w];
+    }
+    let city = cityBits.join(", ");
+    if (COUNTRY_NAMES[city.toUpperCase()]) { if (!out.country) out.country = COUNTRY_NAMES[city.toUpperCase()]; if (city.toUpperCase() !== "SINGAPORE") city = ""; }
+    // the line after the postcode line may be a state (MY) - drop it
+    const after = parts.slice(pcIdx + 1).filter(x => !MY_STATES.test(x));
+    out.city = city;
+    parts = parts.slice(0, pcIdx).concat(after);
+    // postcode on its own line: city is probably the next part
+    if (!out.city && after.length) { out.city = after[0]; parts = parts.slice(0, pcIdx).concat(after.slice(1)); }
+  } else {
+    out.notes.push("No postcode found in the invoice address – please check city and postcode.");
+  }
+  // first line -> Address, the rest -> Address 2 (BC: 100 / 50 characters)
+  out.addressLine1 = parts.shift() || "";
+  // one-line address split on commas: keep filling Address up to BC's 100 characters
+  while (oneLine && parts.length && (out.addressLine1 + ", " + parts[0]).length <= 100) out.addressLine1 += ", " + parts.shift();
+  out.addressLine2 = parts.join(", ");
+  if (out.addressLine1.length > 100) { out.addressLine2 = (out.addressLine1.slice(100) + ", " + out.addressLine2).replace(/,\s*$/, ""); out.addressLine1 = out.addressLine1.slice(0, 100); }
+  if (out.addressLine2.length > 50) out.notes.push("Address 2 is longer than BC allows (50 characters) – please shorten it.");
+  if (out.city.length > 30) out.notes.push("City is longer than BC allows (30 characters) – please shorten it.");
+  return out;
+}
+
+/* free-text payment term from the deal -> a BC payment terms code from presets.js (or "" if unsure) */
+function matchPaymentTerm(text) {
+  const t = String(text || "").toLowerCase();
+  if (!t) return "";
+  const known = new Set((SETTINGS.paymentTerms || []).flatMap(g => g.terms.map(x => x.code)));
+  const direct = String(text).trim().toUpperCase();
+  if (known.has(direct)) return direct;
+  const m = t.match(/(\d+)/);
+  const n = m ? Number(m[1]) : null;
+  let code = "";
+  if (/advance/.test(t) && !/down\s*payment|\bdp\b/.test(t)) code = "ADV100";
+  else if (n == null) code = "";
+  else if (/business|working/.test(t) && /deliver/.test(t)) code = n === 1 ? "BINV1" : `DEL${n}BD`;
+  else if (/business|working/.test(t)) code = /invoice/.test(t) ? `BINV${n}` : (n === 7 ? "7BD" : `BINV${n}`);
+  else if (/invoice/.test(t)) code = `INV${n}`;
+  else if (/day/.test(t) || /\bnet\b/.test(t) || /^\s*\d+\s*d?\s*$/.test(t)) code = String(n).padStart(2, "0") + "D";
+  return known.has(code) ? code : "";
+}
+
+const nameKey = s => normName(String(s || "").replace(/\b(sdn\.?\s*bhd\.?|bhd\.?|berhad|pte\.?\s*ltd\.?|private limited|limited|ltd\.?|plt|llp|inc\.?|corp\.?|co\.?)\b/gi, ""));
+function vendorSetup() { return SETTINGS.vendorSetup || {}; }
+function queueSettings() { return SETTINGS.supplierQueue || {}; }
+
+/* ---------- the tab ---------- */
+function buildSupplierQueue() {
+  const listBox = h("div", { class: "tablewrap" });
+  const reviewBox = h("div", {});
+  const note = h("p", { class: "muted small", style: "margin:.25rem 0 .5rem" });
+  const filter = h("input", { type: "search", placeholder: "Search Asset ID or company", style: "max-width:280px" });
+  const btnPending = h("button", { type: "button", class: "small" }, "Pending");
+  const btnDone = h("button", { type: "button", class: "small ghost" }, "Processed");
+  let view = "pending", groups = [], openKey = null;
+
+  function setView(v) {
+    view = v;
+    btnPending.className = "small" + (v === "pending" ? "" : " ghost");
+    btnDone.className = "small" + (v === "done" ? "" : " ghost");
+    reviewBox.replaceChildren(); openKey = null;
+    draw();
+  }
+  btnPending.addEventListener("click", () => setView("pending"));
+  btnDone.addEventListener("click", () => setView("done"));
+  filter.addEventListener("input", () => draw());
+
+  /* list items -> one group per deal (Asset ID + Entity), split into pending / processed */
+  function groupItems(items) {
+    const since = queueSettings().since ? new Date(queueSettings().since) : null;
+    const map = new Map();
+    for (const it of items) {
+      const st = fv(it, QCOL.status);
+      const done = [QSTATUS.created, QSTATUS.linked, QSTATUS.rejected].includes(st);
+      const assetId = fv(it, "Asset ID (Assigned to BD)") || `(item ${it.id})`;
+      const entity = fv(it, "Entity").toUpperCase();
+      const key = `${assetId}|${entity}|${done ? "done:" + st + ":" + fv(it, QCOL.vendorNo) : "open"}`;
+      if (!map.has(key)) map.set(key, { key, assetId, entity, done, items: [] });
+      map.get(key).items.push(it);
+    }
+    const out = [...map.values()];
+    out.forEach(g => {
+      g.items.sort((a, b) => Number(a.id) - Number(b.id));
+      g.primary = g.items[0];
+      g.status = fv(g.primary, QCOL.status) || QSTATUS.pending;
+      g.approvedDate = fv(g.primary, "Approved Date");
+      const d = new Date(g.approvedDate);
+      g.approvedTime = isNaN(d) ? null : d;
+      g.company = fv(g.primary, "Agreement Company Name") || fv(g.primary, "Supplier");
+      g.beforeCutoff = !g.done && since && g.approvedTime && g.approvedTime < since;
+    });
+    // remember earlier results for the same Asset ID (shown as a hint on new items)
+    out.forEach(g => { if (!g.done) g.earlier = out.filter(x => x.done && x.assetId === g.assetId && x.entity === g.entity && x.status !== QSTATUS.rejected); });
+    return out.sort((a, b) => (b.approvedTime || 0) - (a.approvedTime || 0));
+  }
+
+  function statusTag(st) {
+    const cls = st === QSTATUS.created || st === QSTATUS.linked ? "tag ok" : st === QSTATUS.rejected || st === QSTATUS.creating ? "tag warn" : "tag";
+    return h("span", { class: cls }, st === QSTATUS.creating ? "Interrupted – retry" : st);
+  }
+  const fmtDate = d => d ? d.toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "numeric" }) : "";
+
+  function draw() {
+    const g0 = companyGroup();
+    const q = filter.value.trim().toLowerCase();
+    const mine = groups.filter(g => g.entity === g0);
+    const others = groups.filter(g => g.entity !== g0 && !g.done && !g.beforeCutoff);
+    const rows = mine.filter(g => (view === "pending" ? (!g.done && !g.beforeCutoff) : g.done) &&
+      (!q || g.assetId.toLowerCase().includes(q) || g.company.toLowerCase().includes(q)));
+    const pendingCount = mine.filter(g => !g.done && !g.beforeCutoff).length;
+    setTabBadge(pendingCount);
+    note.replaceChildren(
+      `Showing ${g0 || "?"} deals for ${companyName()}.`,
+      others.length ? ` ${others.length} pending deal(s) belong to the other company – switch company at the top to see them.` : "",
+      view === "pending" && queueSettings().since ? ` Deals approved before ${queueSettings().since} are not listed.` : "");
+    if (!g0) { listBox.replaceChildren(h("p", { class: "muted" }, "This company is not matched to MY or SG in presets.js (companyGroups).")); return; }
+    if (!rows.length) { listBox.replaceChildren(h("p", { class: "muted" }, view === "pending" ? "Nothing waiting." : "No processed deals yet.")); return; }
+    if (view === "pending") {
+      listBox.replaceChildren(h("table", {},
+        h("thead", {}, h("tr", {}, ["Asset ID", "Company", "Agreement type", "Approved", "Products", "Status", ""].map(x => h("th", {}, x)))),
+        h("tbody", {}, rows.map(g => h("tr", {},
+          h("td", {}, g.assetId), h("td", { class: "wrap" }, g.company),
+          h("td", {}, fv(g.primary, "Agreement Type")), h("td", {}, fmtDate(g.approvedTime)),
+          h("td", { class: "num" }, String(g.items.length)), h("td", {}, statusTag(g.status)),
+          h("td", {}, h("button", { type: "button", class: "small" + (openKey === g.key ? "" : " ghost"), onclick: () => openReview(g) }, "Review")))))));
+    } else {
+      listBox.replaceChildren(h("table", {},
+        h("thead", {}, h("tr", {}, ["Asset ID", "Company", "Result", "BC Vendor No.", "BC company", "Reviewed by", "Date", "Reason"].map(x => h("th", {}, x)))),
+        h("tbody", {}, rows.map(g => { const d = new Date(fv(g.primary, QCOL.reviewedDate)); return h("tr", {},
+          h("td", {}, g.assetId), h("td", { class: "wrap" }, g.company), h("td", {}, statusTag(g.status)),
+          h("td", {}, fv(g.primary, QCOL.vendorNo)), h("td", { class: "wrap" }, fv(g.primary, QCOL.company)),
+          h("td", {}, fv(g.primary, QCOL.reviewedBy)), h("td", {}, isNaN(d) ? "" : fmtDate(d)),
+          h("td", { class: "wrap" }, fv(g.primary, QCOL.rejectReason))); }))));
+    }
+  }
+
+  async function refresh() {
+    listBox.replaceChildren(h("p", { class: "muted" }, "Loading the Asset Approval Record List..."));
+    try {
+      groups = groupItems(await spAllItems());
+      draw();
+      if (openKey) { const g = groups.find(x => x.key === openKey && !x.done); if (g) openReview(g); else { reviewBox.replaceChildren(); openKey = null; } }
+    } catch (e) {
+      listBox.replaceChildren(h("p", { class: "muted" }, "Could not load the list: " + e.message));
+    }
+  }
+  refreshers.supplierQueue = refresh;
+
+  /* ---------- review card for one deal ---------- */
+  async function openReview(g) {
+    openKey = g.key; draw();
+    reviewBox.replaceChildren(h("div", { class: "card" }, h("p", { class: "muted" }, "Preparing review...")));
+    try { reviewBox.replaceChildren(await buildReview(g)); reviewBox.scrollIntoView({ behavior: "smooth", block: "start" }); }
+    catch (e) { reviewBox.replaceChildren(h("div", { class: "card" }, h("p", {}, "Could not prepare the review: " + e.message))); }
+  }
+
+  async function buildReview(g) {
+    const p = g.primary, vs = vendorSetup(), grp = companyGroup();
+    const series = queueSettings().noSeries || "PP-VENNO1";
+    const [hasVendorExt, hasBankExt] = await Promise.all([lineExtAvailable("vendors"), lineExtAvailable("vendorBanks")]);
+    let myInvois = false;
+    if (hasVendorExt && grp === "MY") {
+      try { const d = await bcFetch(extBase("vendors") + "?$top=1&$select=myInvoisFieldsAvailable"); myInvois = !!(d.value[0] && d.value[0].myInvoisFieldsAvailable); }
+      catch { myInvois = false; }
+    }
+
+    // ----- prefill -----
+    const addr = splitAddress(fv(p, "Invoice Address"));
+    const country = (addr.country || fv(p, "Device Country") || g.entity || "").toUpperCase();
+    const ptText = fv(p, "Payment Term");
+    const ptCode = matchPaymentTerm(ptText);
+    const dealCcy = fv(p, "Currency").toUpperCase();
+    const lcy = (vs.localCurrency || { MY: "MYR", SG: "SGD" })[grp] || "";
+    const isLocal = country === grp;
+    const d = vs.defaults || {};
+    const regNo = fv(p, "Registration Number");
+    const residential = /^y/i.test(fv(p, "Residential"));
+    const swift = fv(p, "Swift Code").toUpperCase().replace(/\s/g, "");
+    const pre = {
+      displayName: (fv(p, "Agreement Company Name") || fv(p, "Supplier")).toUpperCase(),
+      email: (fv(p, "Finance Email") || fv(p, "Email")).replace(/[,\s]+/g, ";").replace(/;+/g, ";").replace(/^;|;$/g, ""),
+      phoneNumber: fv(p, "Phone Number"),
+      addressLine1: addr.addressLine1.toUpperCase(), addressLine2: addr.addressLine2.toUpperCase(),
+      city: addr.city.toUpperCase(), postalCode: addr.postalCode, country,
+      paymentTerms: ptCode, currencyCode: dealCcy && dealCcy !== lcy ? dealCcy : "",
+      genBusPostingGroup: isLocal ? (d.genBusLocal || "LOCAL") : (d.genBusOverseas || "OVERSEAS"),
+      vendorPostingGroup: d.vendorPostingGroup || "TRADE",
+      vatBusPostingGroup: isLocal ? (d.vatBusLocal || "LOCAL") : (d.vatBusOverseas || "EXPORT"),
+      registrationNumber: regNo,
+      taxIdentificationNo: "", idType: residential ? "NRIC" : "BRN", idNo: regNo,
+      bankName: fv(p, "Bank Name").toUpperCase(), bankAccountNo: fv(p, "Bank Account Number").replace(/\s/g, ""),
+      swiftCode: swift, bankCode: (swift || "MAIN").slice(0, 20)
+    };
+
+    // ----- form -----
+    const ctl = {};
+    const opt = list => (list || []).map(o => typeof o === "string" ? { code: o } : o);
+    function input(key, label, o = {}) {
+      let el;
+      if (o.options) {
+        el = h("select", {}, h("option", { value: "" }, o.required ? "(choose)" : "(none)"),
+          opt(o.options).map(x => h("option", { value: x.code }, x.desc && x.desc !== x.code ? `${x.code} – ${x.desc}` : x.code)));
+        if (pre[key] && ![...el.options].some(x => x.value === pre[key])) el.append(h("option", { value: pre[key] }, pre[key] + " (not in presets)"));
+        el.value = pre[key] || "";
+      } else if (o.groups) {
+        el = h("select", {}, h("option", { value: "" }, "(none)"),
+          o.groups.map(gr => h("optgroup", { label: gr.group }, gr.terms.map(t => h("option", { value: t.code }, `${t.code} – ${t.desc}`)))));
+        el.value = pre[key] || "";
+      } else {
+        el = h("input", { type: "text", value: pre[key] || "", class: o.upper ? "upper" : undefined, maxlength: o.max ? String(o.max) : undefined });
+      }
+      ctl[key] = { el, label, o, get: () => { const v = el.value.trim(); return o.upper ? v.toUpperCase() : v; } };
+      return h("label", { class: o.span ? "span2" : undefined }, label + (o.required ? " *" : ""), el, o.hint ? h("div", { class: "muted small" }, o.hint) : "");
+    }
+    function copyBtn(key) {
+      return h("button", { type: "button", class: "small ghost", style: "margin-top:.2rem", onclick: async ev => {
+        try { await navigator.clipboard.writeText(ctl[key].get()); ev.target.textContent = "Copied"; setTimeout(() => ev.target.textContent = "Copy", 1200); } catch {} } }, "Copy");
+    }
+
+    const vendorFields = h("div", { class: "grid" },
+      h("label", {}, "Supplier ID", h("input", { type: "text", value: `${series} (next no.)`, disabled: true }), h("div", { class: "muted small" }, "Fixed for asset suppliers")),
+      input("displayName", "Name", { required: true, upper: true, max: 100, span: true }),
+      input("email", "Email (separate several with ;)", { max: 80, span: true }),
+      input("phoneNumber", "Phone", { max: 30 }),
+      input("addressLine1", "Address", { upper: true, max: 100, span: true }),
+      input("addressLine2", "Address 2", { upper: true, max: 50 }),
+      input("city", "City", { upper: true, max: 30 }),
+      input("postalCode", "Postal code", { upper: true, max: 20 }),
+      input("country", "Country code", { upper: true, max: 10 }),
+      input("paymentTerms", "Payment Terms Code", { groups: SETTINGS.paymentTerms || [], hint: `Deal says: “${ptText || "(blank)"}”` + (ptCode ? "" : " – no match, please choose") }),
+      input("currencyCode", "Currency (blank = " + (lcy || "local") + ")", { upper: true, max: 10, hint: `Deal currency: ${dealCcy || "(blank)"}` }));
+
+    const regLabel = input("registrationNumber", "Registration Number", { upper: true, max: 50 });
+    const extFields = h("div", { class: "grid" },
+      input("genBusPostingGroup", "Gen. Bus. Posting Group", { required: true, ext: true, options: vs.genBusPostingGroups || (SETTINGS.customerSetup || {}).genBusPostingGroups }),
+      input("vendorPostingGroup", "Vendor Posting Group", { required: true, ext: true, options: vs.vendorPostingGroups }),
+      input("vatBusPostingGroup", "VAT Bus. Posting Group", { required: true, ext: true, options: vs.vatBusPostingGroups || (SETTINGS.vatGroups || {}).po }),
+      ...(hasVendorExt ? [regLabel] : []),
+      ...(myInvois ? [
+        input("taxIdentificationNo", "Tax Identification No. (TIN)", { upper: true, max: 100, hint: "Not captured in Trade Confirmation – optional" }),
+        input("idType", "ID Type", { options: vs.idTypes || (SETTINGS.customerSetup || {}).idTypes, hint: residential ? "Residential = Yes → NRIC" : "Residential = No → BRN" }),
+        input("idNo", "ID No.", { upper: true, max: 100 })
+      ] : []));
+
+    const bankFields = h("div", { class: "grid" },
+      h("div", {}, input("bankName", "Bank name", { upper: true, max: 100 }), copyBtn("bankName")),
+      h("div", {}, input("bankAccountNo", "Bank account no.", { max: 30 }), copyBtn("bankAccountNo")),
+      h("div", {}, input("swiftCode", "SWIFT code", { upper: true, max: 20 }), copyBtn("swiftCode")),
+      hasBankExt ? input("bankCode", "Bank account code in BC", { upper: true, max: 20, hint: "SWIFT code, or MAIN" }) : "",
+      hasVendorExt ? "" : h("div", {}, regLabel, copyBtn("registrationNumber")));
+
+    // ----- duplicate check -----
+    const dupBox = h("div", {});
+    const linkArea = h("div", {});
+    let matches = [];
+    async function runDupCheck() {
+      dupBox.replaceChildren(h("p", { class: "muted small" }, "Checking BC for existing suppliers..."));
+      try {
+        const vendors = await lookups.vendors();
+        const byNo = new Map(vendors.map(v => [v.number, v]));
+        const found = new Map();
+        const reg = ctl.registrationNumber.get();
+        if (reg && hasVendorExt) {
+          try {
+            const r = await bcFetch(extBase("vendors") + `?$filter=registrationNumber eq '${reg.replace(/'/g, "''")}'&$select=number,displayName,registrationNumber`);
+            r.value.forEach(x => found.set(x.number, { ...(byNo.get(x.number) || x), why: "same registration number" }));
+          } catch {}
+        }
+        const k = nameKey(ctl.displayName.get());
+        if (k.length >= 3) vendors.forEach(v => {
+          const vk = nameKey(v.displayName);
+          if (!found.has(v.number) && vk && (vk === k || (vk.length >= 6 && k.length >= 6 && (vk.includes(k) || k.includes(vk)))))
+            found.set(v.number, { ...v, why: vk === k ? "same name" : "similar name" });
+        });
+        (g.earlier || []).forEach(e => { const no = fv(e.primary, QCOL.vendorNo); if (no && !found.has(no)) found.set(no, { ...(byNo.get(no) || { number: no, displayName: "" }), why: `used for this Asset ID before (${e.status})` }); });
+        matches = [...found.values()];
+        dupBox.replaceChildren(matches.length
+          ? h("div", { class: "fx" }, h("h2", {}, "This supplier may already exist in BC"),
+              h("table", {}, h("thead", {}, h("tr", {}, ["Vendor", "Name", "City", "Why", ""].map(x => h("th", {}, x)))),
+                h("tbody", {}, matches.map(m => h("tr", {}, h("td", {}, m.number), h("td", { class: "wrap" }, m.displayName || ""),
+                  h("td", {}, m.city || ""), h("td", {}, h("span", { class: "tag warn" }, m.why)),
+                  h("td", {}, h("button", { type: "button", class: "small ghost", onclick: () => prepareLink(m) }, "Link…")))))))
+          : h("p", { class: "small" }, h("span", { class: "tag ok" }, "No match"), " No existing BC supplier with this name or registration number."));
+      } catch (e) { dupBox.replaceChildren(h("p", { class: "muted small" }, "Duplicate check failed: " + e.message)); }
+    }
+
+    // ----- link: compare first, then confirm -----
+    async function prepareLink(m) {
+      linkArea.replaceChildren(h("p", { class: "muted small" }, `Loading ${m.number} from BC...`));
+      try {
+        const v = (await co(`/vendors?$filter=number eq '${m.number.replace(/'/g, "''")}'`)).value[0];
+        if (!v) throw new Error(`Vendor ${m.number} was not found in this company.`);
+        const diffs = [];
+        const cmp = (label, a, b) => { if (normName(a) !== normName(b)) diffs.push([label, a || "", b || ""]); };
+        cmp("Name", ctl.displayName.get(), v.displayName); cmp("Email", ctl.email.get(), v.email);
+        cmp("Phone", ctl.phoneNumber.get(), v.phoneNumber); cmp("Address", ctl.addressLine1.get(), v.addressLine1);
+        cmp("City", ctl.city.get(), v.city); cmp("Postal code", ctl.postalCode.get(), v.postalCode);
+        cmp("Country", ctl.country.get(), v.country); cmp("Currency", ctl.currencyCode.get(), v.currencyCode);
+        if (hasBankExt) {
+          try {
+            const b = await bcFetch(extBase("vendorBanks") + `?$filter=vendorNumber eq '${m.number.replace(/'/g, "''")}'`);
+            const acct = ctl.bankAccountNo.get();
+            if (acct && !b.value.some(x => normName(x.bankAccountNo) === normName(acct)))
+              diffs.push(["Bank account", acct, b.value.map(x => `${x.code}: ${x.bankAccountNo}`).join("; ") || "(none)"]);
+          } catch {}
+        }
+        if (v.blocked && String(v.blocked).trim()) diffs.push(["Blocked", "", String(v.blocked)]);
+        linkArea.replaceChildren(h("div", { class: "fx" },
+          h("h2", {}, `Link Asset ${g.assetId} to ${v.number} – ${v.displayName}`),
+          h("p", { class: "small" }, "Linking does not change anything in BC. It only records this vendor on the deal."),
+          diffs.length
+            ? h("div", {}, h("p", { class: "small" }, h("span", { class: "tag warn" }, "Differences"), " The deal and the BC vendor differ – update the vendor card in BC yourself if needed:"),
+                h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "Field"), h("th", {}, "Deal"), h("th", {}, "BC vendor"))),
+                  h("tbody", {}, diffs.map(([a, b, c]) => h("tr", {}, h("td", {}, a), h("td", { class: "wrap" }, b), h("td", { class: "wrap" }, c))))))
+            : h("p", { class: "small" }, h("span", { class: "tag ok" }, "Same"), " The deal details match the BC vendor."),
+          h("div", { class: "row-actions" },
+            h("button", { type: "button", class: "ghost", onclick: () => linkArea.replaceChildren() }, "Cancel"),
+            h("button", { type: "button", onclick: ev => doLink(v, ev.target) }, `Confirm link to ${v.number}`))));
+      } catch (e) { linkArea.replaceChildren(h("p", {}, "Could not load the vendor: " + e.message)); }
+    }
+
+    // ----- reject -----
+    const rejectReason = h("input", { type: "text", placeholder: "Reason (required), e.g. wrong counterparty – deal is for ABC Holdings" });
+    const rejectArea = h("div", { class: "fx hidden" }, h("h2", {}, "Reject"),
+      h("label", {}, "Reason", rejectReason),
+      h("div", { class: "row-actions" },
+        h("button", { type: "button", class: "ghost", onclick: () => rejectArea.classList.add("hidden") }, "Cancel"),
+        h("button", { type: "button", class: "danger", onclick: ev => doReject(ev.target) }, "Confirm reject")));
+
+    // ----- actions -----
+    const me = account.username;
+    const nowIso = () => new Date().toISOString();
+    const staleMs = (queueSettings().staleCreatingMinutes || 15) * 60000;
+
+    /* take the deal: refuses if someone else finished it or is busy with it */
+    async function claim(newStatus) {
+      const fresh = await spGetItem(p.id);
+      const st = fv(fresh, QCOL.status), by = fv(fresh, QCOL.reviewedBy);
+      if ([QSTATUS.created, QSTATUS.linked, QSTATUS.rejected].includes(st))
+        throw new Error(`Already ${st.toLowerCase()} by ${by || "someone"} – refresh the list.`);
+      if (st === QSTATUS.creating && by && by.toLowerCase() !== me.toLowerCase()) {
+        const t = new Date(fv(fresh, QCOL.reviewedDate));
+        if (!isNaN(t) && Date.now() - t < staleMs) throw new Error(`${by} is handling this deal right now (started ${t.toLocaleTimeString()}).`);
+      }
+      try { await spWrite(p.id, { [QCOL.status]: newStatus, [QCOL.reviewedBy]: me, [QCOL.reviewedDate]: nowIso(), [QCOL.company]: companyName() }, fresh.eTag); }
+      catch (e) { if (e.status === 412) throw new Error("Someone else just started on this deal – refresh the list."); throw e; }
+      await new Promise(r => setTimeout(r, 1200));
+      const check = await spGetItem(p.id);
+      if (fv(check, QCOL.reviewedBy).toLowerCase() !== me.toLowerCase()) throw new Error(`${fv(check, QCOL.reviewedBy)} started on this deal at the same moment – refresh the list.`);
+      return fresh;   // the state before we claimed it (holds the number of an interrupted attempt)
+    }
+    async function finish(status, vendorNo, reason) {
+      const vals = { [QCOL.status]: status, [QCOL.vendorNo]: vendorNo || "", [QCOL.company]: companyName(),
+                     [QCOL.reviewedBy]: me, [QCOL.reviewedDate]: nowIso(), [QCOL.rejectReason]: reason || "" };
+      const failed = [];
+      for (const it of g.items) { try { await spWrite(it.id, vals); } catch (e) { failed.push(`item ${it.id}: ${e.message}`); } }
+      if (failed.length) throw new Error("Could not update every list item: " + failed.join("; ") + " – click the action again to retry.");
+    }
+    function lock(btn, on) { actionBtns.forEach(b => b.disabled = on); if (btn) btn.disabled = on; }
+
+    function validate() {
+      for (const [k, c] of Object.entries(ctl)) {
+        const v = c.get();
+        if (c.o.ext && !hasVendorExt) continue;
+        if (k === "bankCode" && !hasBankExt) continue;
+        if (c.o.required && !v) throw new Error(`Please fill in ${c.label}.`);
+        if (c.o.max && v.length > c.o.max) throw new Error(`${c.label} is ${v.length} characters; BC allows ${c.o.max}.`);
+      }
+      const emails = ctl.email.get().split(";").map(x => x.trim()).filter(Boolean);
+      const bad = emails.filter(x => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(x));
+      if (bad.length) throw new Error("Email not valid: " + bad.join(", "));
+      if (hasBankExt && ctl.bankAccountNo.get() && !ctl.bankCode.get()) throw new Error("Please fill in the bank account code.");
+    }
+
+    async function doCreate(btn) {
+      try { validate(); } catch (e) { setStatus(e.message, "err"); return; }
+      if (matches.length && !confirm(`BC may already have this supplier (${matches.map(m => m.number).join(", ")}). Create a NEW vendor anyway?`)) return;
+      lock(btn, true);
+      const notes = [];
+      try {
+        setStatus(`Taking Asset ${g.assetId}...`);
+        const before = await claim(QSTATUS.creating);
+        // 1. vendor number – reuse the one an interrupted attempt already took
+        let number = fv(before, QCOL.vendorNo);
+        if (!number) {
+          setStatus(`Taking the next number from ${series}...`);
+          number = await nextNumberFrom(series);
+          await spWrite(p.id, { [QCOL.vendorNo]: number });
+        }
+        // 2. vendor card (skip if an interrupted attempt already created it)
+        let rec = (await co(`/vendors?$filter=number eq '${number.replace(/'/g, "''")}'`)).value[0];
+        if (!rec) {
+          setStatus(`Creating supplier ${number}...`);
+          const body = { number, displayName: ctl.displayName.get() };
+          for (const k of ["email", "phoneNumber", "addressLine1", "addressLine2", "city", "postalCode", "country", "currencyCode"]) {
+            let v = ctl[k].get(); if (k === "email") v = v.split(";").map(x => x.trim()).filter(Boolean).join(";");
+            if (v) body[k] = v;
+          }
+          const pt = ctl.paymentTerms.get();
+          if (pt) {
+            const t = (await paymentTermsLookup()).find(x => String(x.code).toUpperCase() === pt.toUpperCase());
+            if (t) body.paymentTermsId = t.id; else notes.push(`payment terms ${pt} does not exist in this company – set it in BC`);
+          }
+          rec = await co(`/vendors`, { method: "POST", body: JSON.stringify(body) });
+        } else notes.push(`vendor ${number} already existed from an earlier attempt – reused it`);
+        // 3. posting groups, registration number, MyInvois (extension v1.4)
+        if (hasVendorExt) {
+          setStatus(`Created ${number}. Setting posting groups...`);
+          const ext = {};
+          for (const k of ["genBusPostingGroup", "vendorPostingGroup", "vatBusPostingGroup", "registrationNumber"].concat(myInvois ? ["taxIdentificationNo", "idType", "idNo"] : [])) {
+            const v = ctl[k].get(); if (v) ext[k] = v;
+          }
+          try { await bcFetch(`${extBase("vendors")}(${rec.id})`, { method: "PATCH", headers: { "If-Match": "*" }, body: JSON.stringify(ext) }); }
+          catch (e) { notes.push(`posting groups / registration / MyInvois NOT set (${e.message})`); }
+        } else notes.push("posting groups and registration number not set – Saxon Portal API v1.4 is not installed");
+        // 4. bank account (extension v1.4)
+        const acct = ctl.bankAccountNo.get();
+        if (acct && hasBankExt) {
+          setStatus(`Adding bank account to ${number}...`);
+          try {
+            const code = ctl.bankCode.get();
+            const existing = await bcFetch(extBase("vendorBanks") + `?$filter=vendorNumber eq '${number.replace(/'/g, "''")}' and code eq '${code.replace(/'/g, "''")}'`);
+            if (!existing.value.length)
+              await bcFetch(extBase("vendorBanks"), { method: "POST", body: JSON.stringify({ vendorNumber: number, code, name: ctl.bankName.get(),
+                bankAccountNo: acct, swiftCode: ctl.swiftCode.get(), currencyCode: ctl.currencyCode.get(), setAsPreferred: true }) });
+          } catch (e) { notes.push(`bank account NOT added (${e.message})`); }
+        } else if (acct) notes.push("bank details not added – Saxon Portal API v1.4 is not installed, copy them into BC");
+        // 5. record the result on every list item of the deal
+        setStatus(`Recording ${number} on the SharePoint list...`);
+        await finish(QSTATUS.created, number, "");
+        clearCache("vendors");
+        setStatus(`Created supplier ${number} – ${rec.displayName} for Asset ${g.assetId}.` + (notes.length ? " Note: " + notes.join("; ") + "." : ""), notes.length ? "warn" : "ok");
+        reviewBox.replaceChildren(); openKey = null;
+        refresh();
+      } catch (e) {
+        setStatus("Error: " + e.message + " – the deal stays in Pending; open it and click Create again to continue where it stopped.", "err");
+        refresh();
+      } finally { lock(btn, false); }
+    }
+
+    async function doLink(v, btn) {
+      lock(btn, true);
+      try {
+        setStatus(`Linking Asset ${g.assetId} to ${v.number}...`);
+        const before = await claim(QSTATUS.creating);
+        if (fv(before, QCOL.vendorNo) && fv(before, QCOL.vendorNo) !== v.number)
+          throw new Error(`An earlier Create already took number ${fv(before, QCOL.vendorNo)} for this deal. Click Create to finish that instead, or clear "BC Vendor No." on the list item first.`);
+        await finish(QSTATUS.linked, v.number, "");
+        setStatus(`Asset ${g.assetId} linked to ${v.number} – ${v.displayName}.`, "ok");
+        reviewBox.replaceChildren(); openKey = null;
+        refresh();
+      } catch (e) { setStatus("Error: " + e.message, "err"); }
+      finally { lock(btn, false); }
+    }
+
+    async function doReject(btn) {
+      const reason = rejectReason.value.trim();
+      if (!reason) { setStatus("Please give a reason for the rejection.", "err"); rejectReason.focus(); return; }
+      lock(btn, true);
+      try {
+        const before = await claim(QSTATUS.creating);
+        if (fv(before, QCOL.vendorNo)) throw new Error(`An earlier Create already took number ${fv(before, QCOL.vendorNo)} for this deal – finish or clean that up in BC before rejecting.`);
+        await finish(QSTATUS.rejected, "", reason);
+        setStatus(`Asset ${g.assetId} rejected.`, "ok");
+        reviewBox.replaceChildren(); openKey = null;
+        refresh();
+      } catch (e) { setStatus("Error: " + e.message, "err"); }
+      finally { lock(btn, false); }
+    }
+
+    const createBtn = h("button", { type: "button", onclick: ev => doCreate(ev.target) }, g.status === QSTATUS.creating ? "Continue create" : "Create supplier in BC");
+    const rejectBtn = h("button", { type: "button", class: "danger", onclick: () => { rejectArea.classList.remove("hidden"); rejectReason.focus(); } }, "Reject…");
+    const actionBtns = [createBtn, rejectBtn];
+
+    ctl.displayName.el.addEventListener("change", runDupCheck);
+    ctl.registrationNumber.el.addEventListener("change", runDupCheck);
+    runDupCheck();
+
+    const agreementUrl = fv(p, "Agreement File URL");
+    const interrupted = g.status === QSTATUS.creating
+      ? h("p", { class: "small" }, h("span", { class: "tag warn" }, "Interrupted"),
+          ` ${fv(p, QCOL.reviewedBy) || "Someone"} started creating this supplier` + (fv(p, QCOL.vendorNo) ? ` and took number ${fv(p, QCOL.vendorNo)}` : "") + " but it did not finish. Create will continue with the same number.")
+      : "";
+    const addrNotes = addr.notes.map(n => h("p", { class: "small" }, h("span", { class: "tag warn" }, "Check"), " ", n));
+
+    return h("div", { class: "card" },
+      h("div", { class: "card-head" },
+        h("h2", {}, `Asset ${g.assetId} – ${g.company}`),
+        h("button", { type: "button", class: "small ghost", onclick: () => { reviewBox.replaceChildren(); openKey = null; draw(); } }, "Close")),
+      h("p", { class: "muted small", style: "margin-top:-.4rem" },
+        `${fv(p, "Agreement Type")} · Entity ${g.entity} → ${companyName()} · approved by ${fv(p, "Approved By")} on ${fmtDate(g.approvedTime)} · BD ${fv(p, "Title")} · ${g.items.length} product(s)`,
+        agreementUrl ? [" · ", h("a", { href: agreementUrl, target: "_blank", rel: "noopener" }, "Agreement file")] : ""),
+      interrupted,
+      dupBox, linkArea,
+      h("div", { class: "sub" }, "Original invoice address on the deal"),
+      h("div", { class: "party-info", style: "white-space:pre-line" }, fv(p, "Invoice Address") || "(blank)"),
+      ...addrNotes,
+      h("div", { class: "sub" }, "Supplier card"), vendorFields,
+      hasVendorExt
+        ? [h("div", { class: "sub" }, "Posting groups & registration"), extFields]
+        : h("p", { class: "small" }, h("span", { class: "tag warn" }, "v1.4 not installed"), " Posting groups, registration number and MyInvois fields will not be set – fill them in BC after creating."),
+      h("div", { class: "sub" }, hasBankExt ? "Bank account (added to BC and set as preferred)" : "Bank details (copy into BC by hand – Saxon Portal API v1.4 is not installed)"),
+      bankFields,
+      rejectArea,
+      h("div", { class: "row-actions" }, createBtn, rejectBtn,
+        h("span", { class: "muted small" }, `Company: ${companyName()} · number from ${series}`)));
+  }
+
+  return h("div", {},
+    h("div", { class: "card" },
+      h("div", { class: "card-head" }, h("h2", {}, "Suppliers from approved asset deals"),
+        h("div", { class: "row-actions", style: "margin:0" }, btnPending, btnDone, filter,
+          h("button", { type: "button", class: "small ghost", onclick: refresh }, "Refresh"))),
+      note, listBox),
+    reviewBox);
+}
+function setTabBadge(n) {
+  const b = document.querySelector('#tabs button[data-tab="supplierQueue"]');
+  if (b) b.textContent = "Pending suppliers" + (n ? ` (${n})` : "");
+}
+
 /* ---------- inventory tab ---------- */
 function buildInventory() {
   const listBox = h("div", { class: "tablewrap" });
   const search = h("input", { type: "search", placeholder: "Search part no. or description" });
-  const COUNTRIES = ["MALAYSIA", "SINGAPORE", "VIETNAM"];
-  const mkSel = () => h("select", {}, h("option", { value: "" }, "All"));
-  const countrySel = h("select", {}, h("option", { value: "" }, "All"),
-    COUNTRIES.map(c => h("option", { value: c }, c.charAt(0) + c.slice(1).toLowerCase())));
-  const techSel = mkSel(), yearSel = mkSel(), regSel = mkSel();
+  const onlyInv = h("input", { type: "checkbox", checked: true });
+  const lowOnly = h("input", { type: "checkbox" });
   const count = h("span", { class: "muted" });
-  const totalQty = h("div", { class: "inv-sum-val" }, "–");
-  const totalVal = h("div", { class: "inv-sum-val" }, "–");
   let all = [];
 
   const cols = [["number","Part no."],["displayName","Description"],["inventory","Inventory"],
-                ["baseUnitOfMeasureCode","UoM"],["unitCost","Unit cost"],["type","Type"]];
-
-  // e.g. "MALAYSIA SMALL HYDRO RECS V24 (IREC)" -> country MALAYSIA, tech SMALL HYDRO, year 2024, registry IREC
-  function parseDesc(d) {
-    const s = String(d || "").toUpperCase().replace(/\s+/g, " ").trim();
-    const country = COUNTRIES.find(c => s.startsWith(c + " ")) || "";
-    const m = s.match(/^(.*?)\s*\bRECS?\b\s*V(\d{2})\b/);
-    const tech = m ? m[1].slice(country.length).trim() : "";
-    const year = m ? "20" + m[2] : "";
-    const reg = (s.match(/\(([^)]+)\)\s*$/) || [])[1] || "";
-    return { country, tech, year, reg: reg.trim() };
-  }
-
-  function fillSel(sel, values, label = v => v) {
-    const keep = sel.value;
-    sel.replaceChildren(h("option", { value: "" }, "All"), ...values.map(v => h("option", { value: v }, label(v))));
-    sel.value = values.includes(keep) ? keep : "";
-  }
-
-  const fmt = (n, dp = 2) => n.toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp });
+                ["baseUnitOfMeasureCode","UoM"],["unitCost","Unit cost"],["unitPrice","Unit price"],["type","Type"]];
 
   function draw() {
     const q = search.value.trim().toLowerCase();
-    const f = { country: countrySel.value, tech: techSel.value, year: yearSel.value, reg: regSel.value };
     const rows = all.filter(r =>
-      (!f.country || r._p.country === f.country) &&
-      (!f.tech || r._p.tech === f.tech) &&
-      (!f.year || r._p.year === f.year) &&
-      (!f.reg || r._p.reg === f.reg) &&
+      (!onlyInv.checked || r.type === "Inventory") &&
+      (!lowOnly.checked || (Number(r.inventory) || 0) <= CONFIG.lowStockThreshold) &&
       (!q || (r.number || "").toLowerCase().includes(q) || (r.displayName || "").toLowerCase().includes(q)));
     renderTable(listBox, cols, rows, [], {
       cellClass: (r, k) => k === "inventory" && r.type === "Inventory" && (Number(r.inventory) || 0) <= CONFIG.lowStockThreshold ? "low" : ""
     });
-    const qty = rows.reduce((s, r) => s + (Number(r.inventory) || 0), 0);
-    const val = rows.reduce((s, r) => s + (Number(r.inventory) || 0) * (Number(r.unitCost) || 0), 0);
-    totalQty.textContent = fmt(qty, 0);
-    totalVal.textContent = fmt(val, 2);
-    count.textContent = `${rows.length} of ${all.length} items in stock`;
+    count.textContent = `${rows.length} of ${all.length} items`;
   }
-  [search].forEach(el => el.addEventListener("input", draw));
-  [countrySel, techSel, yearSel, regSel].forEach(el => el.addEventListener("change", draw));
+  search.addEventListener("input", draw);
+  onlyInv.addEventListener("change", draw);
+  lowOnly.addEventListener("change", draw);
 
   async function refresh() {
     try {
       listBox.replaceChildren(h("p", { class: "muted" }, "Loading..."));
       const data = await co(`/items?$top=2000&$orderby=number`);
-      all = data.value.filter(r => (Number(r.inventory) || 0) !== 0)   // hide zero stock
-                      .map(r => ({ ...r, _p: parseDesc(r.displayName) }));
-      const uniq = k => [...new Set(all.map(r => r._p[k]).filter(Boolean))].sort();
-      fillSel(techSel, uniq("tech"));
-      fillSel(yearSel, uniq("year"));
-      fillSel(regSel, uniq("reg"));
+      all = data.value;
       draw();
     } catch (e) { listBox.replaceChildren(h("p", { class: "muted" }, "Could not load inventory: " + e.message)); }
   }
@@ -732,16 +1343,11 @@ function buildInventory() {
   return h("div", {},
     h("div", { class: "card" }, h("h2", {}, "Inventory on hand"),
       h("div", { class: "grid" },
-        h("label", { class: "span2" }, "Search", search),
-        h("label", {}, "Country", countrySel),
-        h("label", {}, "Tech", techSel),
-        h("label", {}, "Year", yearSel),
-        h("label", {}, "Registry", regSel),
+        h("label", {}, "Search", search),
+        h("label", { class: "chk" }, onlyInv, "Inventory-type items only"),
+        h("label", { class: "chk" }, lowOnly, `Low stock only (≤ ${CONFIG.lowStockThreshold})`),
         h("button", { type: "button", class: "ghost", onclick: refresh }, "Refresh")),
-      h("div", { class: "inv-sum" },
-        h("div", {}, h("div", { class: "inv-sum-lbl" }, "Total inventory"), totalQty),
-        h("div", {}, h("div", { class: "inv-sum-lbl" }, "Total value (Inventory × Unit cost)"), totalVal),
-        h("div", { style: "align-self:end" }, count))),
+      h("div", { class: "row-actions" }, count)),
     h("div", { class: "card" }, listBox)
   );
 }
@@ -1655,7 +2261,7 @@ function showTab(id) {
   if (!TABS.some(t => t.id === id)) id = TABS[0].id;
   document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === id));
   document.querySelectorAll("#panels > div").forEach(p => p.classList.toggle("hidden", p.dataset.tab !== id));
-  if ((!loaded[id] || id === "inventory" || id === "approvals") && refreshers[id]) { loaded[id] = true; refreshers[id](); }
+  if ((!loaded[id] || id === "inventory" || id === "approvals" || id === "supplierQueue") && refreshers[id]) { loaded[id] = true; refreshers[id](); }
 }
 function buildUI(activeId) {
   Object.keys(loaded).forEach(k => delete loaded[k]);

@@ -74,6 +74,29 @@ window.PORTAL_PRESETS = {
     idTypes: [ { code: "NRIC" }, { code: "PASSPORT" }, { code: "BRN" }, { code: "Army" } ]
   },
 
+  // Pending suppliers tab (suppliers from approved asset deals).
+  //   since:  deals approved BEFORE this date are not listed (set to the go-live date)
+  //   noSeries: every asset supplier takes its number from this series (fixed)
+  //   staleCreatingMinutes: after this long, someone else may continue an interrupted Create
+  supplierQueue: { since: "2026-11-10", noSeries: "PP-VENNO1", staleCreatingMinutes: 15 },
+
+  // Dropdowns and defaults for asset suppliers. Needs Saxon Portal API v1.4.
+  // Defaults: LOCAL when the supplier's country = the company's (MY / SG), otherwise OVERSEAS / EXPORT.
+  // TODO: replace vendorPostingGroups with the real codes from BC (Vendor Posting Groups page).
+  vendorSetup: {
+    genBusPostingGroups: [
+      { code: "INTERCO", desc: "INTERCO" }, { code: "LOCAL", desc: "LOCAL" },
+      { code: "OVERSEAS", desc: "OVERSEAS" }, { code: "RELATED", desc: "RELATED" } ],
+    vendorPostingGroups: [
+      { code: "TRADE",     desc: "Trade Payables (placeholder - check BC)" },
+      { code: "NON-TRADE", desc: "Non-Trade Payables (placeholder - check BC)" } ],
+    vatBusPostingGroups: [ { code: "LOCAL" }, { code: "EXPORT" }, { code: "PURCH-ZP" }, { code: "PURCH-TX" } ],
+    idTypes: [ { code: "NRIC" }, { code: "PASSPORT" }, { code: "BRN" }, { code: "Army" } ],
+    defaults: { genBusLocal: "LOCAL", genBusOverseas: "OVERSEAS", vendorPostingGroup: "TRADE",
+                vatBusLocal: "LOCAL", vatBusOverseas: "EXPORT" },
+    localCurrency: { MY: "MYR", SG: "SGD" }   // vendor currency is left blank when the deal is in this
+  },
+
   // Defaults for new part numbers (Costs & Posting)
   itemDefaults: { generalProductPostingGroupCode: "RECS", inventoryPostingGroupCode: "RECS" },
 
