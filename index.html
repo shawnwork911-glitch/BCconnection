@@ -687,7 +687,7 @@ function buildInventory() {
 
   function fillSel(sel, values, label = v => v) {
     const keep = sel.value;
-    sel.replaceChildren(h("option", { value: "" }, "All"), values.map(v => h("option", { value: v }, label(v))));
+    sel.replaceChildren(h("option", { value: "" }, "All"), ...values.map(v => h("option", { value: v }, label(v))));
     sel.value = values.includes(keep) ? keep : "";
   }
 
