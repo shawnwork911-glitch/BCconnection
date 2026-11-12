@@ -54,6 +54,11 @@
   .small { font-size:.8rem; }
   .row-actions { display:flex; gap:.5rem; margin-top:.75rem; flex-wrap:wrap; align-items:center; }
   .hidden { display:none !important; }
+  .invalid input, .invalid select, .invalid textarea, input.invalid, select.invalid { border-color:var(--danger) !important; background:#fff7f6; }
+  .block.invalid, .comment-row.invalid { border-left-color:var(--danger); }
+  .field-err { color:var(--danger); font-size:.78rem; margin-top:.2rem; font-weight:normal; }
+  .form-err { grid-column:1 / -1; background:#fdecea; color:#8a1c12; border-radius:6px; padding:.5rem .75rem; margin:.6rem 0; font-size:.85rem; }
+  .form-err ul { margin:.25rem 0 0 1.1rem; padding:0; }
   code { background:#f0f3f6; padding:.1rem .3rem; border-radius:3px; }
   .tag { display:inline-block; font-size:.75rem; padding:.1rem .45rem; border-radius:10px; background:#eef2f6; color:var(--muted); margin:0 .25rem .15rem 0; white-space:nowrap; }
   .tag.warn { background:var(--warn-bg); color:var(--warn); }
@@ -304,6 +309,55 @@ function h(tag, attrs = {}, ...kids) {
   kids.flat().forEach(c => el.append(c instanceof Node ? c : document.createTextNode(c ?? "")));
   return el;
 }
+
+/* ---------- errors shown next to the field / section they belong to ----------
+   errs: [{ msg, el }] – el is the input, label or section box (optional) */
+function clearMarks(root) {
+  if (!root) return;
+  root.querySelectorAll(".field-err").forEach(e => e.remove());
+  root.querySelectorAll(".invalid").forEach(e => e.classList.remove("invalid"));
+  root.querySelectorAll(".form-err").forEach(e => e.remove());
+}
+function markError(el, msg) {
+  if (!el) return null;
+  const host = el.matches("label, .block, .comment-row, .periods, .card") ? el : (el.closest("label") || el);
+  host.classList.add("invalid");
+  const blk = host.parentElement && host.parentElement.closest(".block");
+  if (blk) blk.classList.add("invalid");
+  const note = h("div", { class: "field-err" }, msg);
+  if (host.matches(".block, .comment-row")) {
+    const head = host.querySelector(":scope > .block-head");
+    head ? head.after(note) : host.prepend(note);
+  } else if (host.matches("input, select, textarea")) host.after(note);
+  else host.append(note);
+  return host;
+}
+/* marks every error, puts a summary box before `summaryAt`, scrolls to the first one */
+function showErrors(root, errs, summaryAt) {
+  clearMarks(root);
+  let first = null;
+  errs.forEach(e => { const m = markError(e.el, e.msg); first = first || m; });
+  if (summaryAt && errs.length) {
+    const box = h("div", { class: "form-err" }, h("b", {}, errs.length === 1 ? "Please fix this before continuing:" : `Please fix these ${errs.length} things before continuing:`),
+      h("ul", {}, errs.map(e => h("li", {}, e.msg))));
+    summaryAt.before(box);
+    first = first || box;
+  }
+  if (first) first.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+/* once the user changes a marked field, its own error goes away */
+function autoClearMarks(root) {
+  const clear = e => {
+    const host = e.target.closest && e.target.closest(".invalid");
+    if (!host) return;
+    host.classList.remove("invalid");
+    [...host.children].filter(c => c.classList.contains("field-err")).forEach(c => c.remove());
+    if (host.nextElementSibling && host.nextElementSibling.classList.contains("field-err")) host.nextElementSibling.remove();
+  };
+  root.addEventListener("input", clear); root.addEventListener("change", clear);
+  return root;
+}
+const errText = errs => errs.map(e => e.msg).join(" ");
 
 /* cols: [key,label]; extraCols: [{label, render(row) -> Node}] */
 function renderTable(box, cols, rows, extraCols = [], opts = {}) {
@@ -571,16 +625,19 @@ function buildMaster(key) {
     controls[f.key] = { get: () => input.value.trim(), reset() { input.value = def0; } };
     return h("label", {}, f.label, input);
   });
+  const labelOf = {};   // key -> its <label>, for showing errors next to the field
+  def.fields.forEach((f, i) => { labelOf[f.key] = fieldEls[i]; });
   const btn = h("button", { type: "submit" }, "Preview");
-  const form = h("form", { class: "grid" }, fieldEls, btn);
+  const form = autoClearMarks(h("form", { class: "grid", novalidate: true }, fieldEls, btn));
   const previewCard = h("div", { class: "card hidden preview" });
   let pending = null;   // { body, series }
 
   /* read + check the form; nothing is sent to BC here */
   async function collect() {
-    const body = {}, extBody = {}, shown = [];
+    const body = {}, extBody = {}, shown = [], errs = [];
     let series = null;
     for (const f of def.fields) {
+     try {
       const v = controls[f.key].get();
       if (f.kind === "noSeries") {
         if (v.series) { series = v.series; shown.push([f.label, `Next number from ${v.series} (taken when you click Create)`]); }
@@ -626,16 +683,21 @@ function buildMaster(key) {
       }
       body[f.key] = f.type === "number" ? Number(v) : (f.upper ? v.toUpperCase() : v);
       shown.push([f.label, String(body[f.key])]);
+     } catch (e) { errs.push({ msg: e.message, el: labelOf[f.key] }); }
     }
+    const fail = () => { const e = new Error(errText(errs)); e.errs = errs; return e; };
+    if (errs.length) throw fail();
     // duplicate checks against what is already in BC
     const warnings = [];
     try {
       const existing = await lookups[def.endpoint]();
-      if (body.number && existing.some(r => String(r.number).toUpperCase() === body.number.toUpperCase()))
-        throw new Error(`${def.fields[0].label} ${body.number} already exists in BC.`);
+      if (body.number && existing.some(r => String(r.number).toUpperCase() === body.number.toUpperCase())) {
+        errs.push({ msg: `${def.fields[0].label} ${body.number} already exists in BC.`, el: labelOf.number || labelOf[def.fields[0].key] });
+        throw fail();
+      }
       const same = existing.filter(r => body.displayName && normName(r.displayName) === normName(body.displayName));
       if (same.length) warnings.push(`A ${def.singular} with the same name already exists: ${same.map(r => r.number).join(", ")}`);
-    } catch (e) { if (/already exists/.test(e.message)) throw e; }
+    } catch (e) { if (e.errs) throw e; }
     if (Object.keys(extBody).length && !(await lineExtAvailable(key)))
       warnings.push("The Saxon Portal API extension v1.3 is not installed yet, so posting groups and MyInvois fields will NOT be set – you would need to fill them in BC.");
     if (def.noteAuto) shown.unshift([def.fields[0].key === "displayName" ? "Customer ID" : "ID", "(given automatically by BC)"]);
@@ -670,12 +732,15 @@ function buildMaster(key) {
 
   form.addEventListener("submit", async ev => {
     ev.preventDefault();
-    btn.disabled = true; setStatus("Checking...");
+    btn.disabled = true; setStatus("Checking..."); clearMarks(form);
     try {
       pending = await collect();
       showPreview(pending);
       setStatus(pending.warnings.length ? "Preview ready – please check the notes, then Create or go back." : "Preview ready. Check it, then click Create.", pending.warnings.length ? "warn" : "ok");
-    } catch (e) { setStatus("Error: " + e.message, "err"); }
+    } catch (e) {
+      setStatus("Error: " + e.message, "err");
+      showErrors(form, e.errs || [{ msg: e.message }], btn);
+    }
     finally { btn.disabled = false; }
   });
 
@@ -698,12 +763,16 @@ function buildMaster(key) {
           kind = "warn";
         }
       }
+      clearMarks(previewCard);
       setStatus(`Created ${def.singular} ${rec.number} - ${rec.displayName}.` + extNote, kind);
       Object.values(controls).forEach(c => c.reset());
       pending = null; backToEdit();
       clearCache(def.endpoint);
       refresh();
-    } catch (e) { setStatus("Error: " + e.message, "err"); }
+    } catch (e) {
+      setStatus("Error: " + e.message, "err");
+      showErrors(previewCard, [{ msg: "BC did not accept it: " + e.message }], createBtn.parentElement);
+    }
     finally { createBtn.disabled = false; }
   }
 
@@ -1370,17 +1439,19 @@ function buildPartyQueue(role) {
 
     function lock(on) { actionBtns.forEach(b => b.disabled = on); }
     function validate() {
+      const errs = [];
       for (const [k, c] of Object.entries(ctl)) {
         if (c.o.ext && !hasExt) continue;
         if (k === "bankCode" && !hasBankExt) continue;
         const v = c.get();
-        if (c.o.required && !v) throw new Error(`Please fill in ${c.label}.`);
-        if (c.o.max && v.length > c.o.max) throw new Error(`${c.label} is ${v.length} characters; BC allows ${c.o.max}.`);
+        if (c.o.required && !v) errs.push({ msg: `Please fill in ${c.label}.`, el: c.el });
+        else if (c.o.max && v.length > c.o.max) errs.push({ msg: `${c.label} is ${v.length} characters; BC allows ${c.o.max}.`, el: c.el });
       }
       const emails = ctl.email.get().split(";").map(x => x.trim()).filter(Boolean);
       const bad = emails.filter(x => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(x));
-      if (bad.length) throw new Error("Email not valid: " + bad.join(", "));
-      if (hasBankExt && ctl.bankAccountNo.get() && !ctl.bankCode.get()) throw new Error("Please fill in the bank account code.");
+      if (bad.length) errs.push({ msg: "Email not valid: " + bad.join(", "), el: ctl.email.el });
+      if (hasBankExt && ctl.bankAccountNo.get() && !ctl.bankCode.get()) errs.push({ msg: "Please fill in the bank account code.", el: ctl.bankCode.el });
+      if (errs.length) { const e = new Error(errText(errs)); e.errs = errs; throw e; }
     }
     function cardBody() {
       const body = { displayName: ctl.displayName.get() };
@@ -1394,7 +1465,8 @@ function buildPartyQueue(role) {
     function done(msg, kind) { setStatus(msg, kind); clearCache(R.lookup); closeReview(); }
 
     async function doCreate() {
-      try { validate(); } catch (e) { setStatus(e.message, "err"); return; }
+      clearMarks(card);
+      try { validate(); } catch (e) { setStatus(e.message, "err"); showErrors(card, e.errs || [{ msg: e.message }], actionRow); return; }
       if (matches.length && !confirm(`BC may already have this ${R.noun} (${matches.map(m => m.number).join(", ")}). Create a NEW one anyway?`)) return;
       lock(true);
       const notes = [];
@@ -1454,6 +1526,7 @@ function buildPartyQueue(role) {
         done(`Created ${R.noun} ${number} – ${rec.displayName} for ${PARTY_SOURCES[g.source].label} ${g.ref}.` + (notes.length ? " Note: " + notes.join("; ") + "." : ""), notes.length ? "warn" : "ok");
       } catch (e) {
         setStatus("Error: " + e.message + " – the deal stays in Pending; open it and click Create again to continue where it stopped.", "err");
+        showErrors(card, [{ msg: "BC stopped the create: " + e.message + " – click Create again to continue where it stopped." }], actionRow);
         refresh();
       } finally { lock(false); }
     }
@@ -1473,7 +1546,7 @@ function buildPartyQueue(role) {
 
     async function doReject() {
       const reason = rejectReason.value.trim();
-      if (!reason) { setStatus("Please give a reason for the rejection.", "err"); rejectReason.focus(); return; }
+      if (!reason) { setStatus("Please give a reason for the rejection.", "err"); showErrors(card, [{ msg: "Please give a reason for the rejection.", el: rejectReason }]); rejectReason.focus(); return; }
       lock(true);
       try {
         const claimed = await handler.claim();
@@ -1504,7 +1577,9 @@ function buildPartyQueue(role) {
         (fv(p, "Registry") ? ` · ${fv(p, "Registry")}` : "");
     const agreementUrl = fv(p, "Agreement File URL");
 
-    return h("div", { class: "card" },
+    const actionRow = h("div", { class: "row-actions" }, createBtn, rejectBtn,
+        h("span", { class: "muted small" }, `Company: ${companyName()}` + (isSupplier ? ` · number from ${series}` : "")));
+    const card = autoClearMarks(h("div", { class: "card" },
       h("div", { class: "card-head" },
         h("h2", {}, `${PARTY_SOURCES[g.source].label} ${g.ref} – ${g.company}`),
         h("button", { type: "button", class: "small ghost", onclick: () => { reviewBox.replaceChildren(); openKey = null; draw(); } }, "Close")),
@@ -1523,8 +1598,8 @@ function buildPartyQueue(role) {
         : h("p", { class: "small" }, h("span", { class: "tag warn" }, `${isSupplier ? "v1.4" : "v1.3"} not installed`), " Posting groups and MyInvois fields will not be set – fill them in BC after creating."),
       isSupplier ? [h("div", { class: "sub" }, hasBankExt ? "Bank account (added to BC and set as preferred)" : "Bank details (copy into BC by hand – Saxon Portal API v1.4 is not installed)"), bankFields] : "",
       rejectArea,
-      h("div", { class: "row-actions" }, createBtn, rejectBtn,
-        h("span", { class: "muted small" }, `Company: ${companyName()}` + (isSupplier ? ` · number from ${series}` : ""))));
+      actionRow));
+    return card;
   }
 
   return h("div", {},
@@ -1735,11 +1810,13 @@ function makeCommentRow(onRemove, onMove) {
       h("div", { style: "display:flex;gap:.4rem;align-items:center" }, out, resetBtn)),
     hint);
   row.text = () => out.value.trim();
-  row.validate = () => {
-    if (!row.text()) return "A comment line is empty.";
-    if (!edited && fields.some(f => !f.el.value.trim())) return `Fill in the boxes of comment "${COMMENT_TEMPLATES[tplSel.value].label}".`;
+  row.check = () => {   // -> { msg, el } or null
+    if (!row.text()) return { msg: "A comment line is empty.", el: out };
+    const empty = edited ? null : fields.find(f => !f.el.value.trim());
+    if (empty) return { msg: `Fill in “${empty.label}” of comment "${COMMENT_TEMPLATES[tplSel.value].label}".`, el: empty.el };
     return null;
   };
+  row.validate = () => (row.check() || {}).msg || null;
   build();
   return row;
 }
@@ -1762,6 +1839,7 @@ function makeCommentList(buttonText) {
     box, add,
     btn: h("button", { type: "button", class: "ghost small", onclick: add }, buttonText),
     validate: () => rows.map(r => r.validate()).filter(Boolean),
+    errs: () => rows.map(r => r.check()).filter(Boolean),
     lines: () => rows.map(r => ({ lineType: "Comment", description: r.text() })),
     clear() { rows.length = 0; box.replaceChildren(); }
   };
@@ -1945,18 +2023,20 @@ function buildOrder(key) {
 
     blk.refresh = drawPreview;
     blk.items = () => [item.value];
-    blk.validate = () => {
-      if (!item.value) return "Every item needs a part no.";
-      if (!base.value.trim()) return `${item.value}: description is empty.`;
-      if (!ticked().length) return `${item.value}: tick at least one period.`;
+    blk.itemEl = item.el;
+    blk.validate = () => {   // -> { msg, el } or null
+      if (!item.value) return { msg: "Every item needs a part no.", el: item.el };
+      if (!base.value.trim()) return { msg: `${item.value}: description is empty.`, el: base };
+      if (!ticked().length) return { msg: `${item.value}: tick at least one period.`, el: periodsBox };
       const long = ticked().map(x => (st.over[x.label] || {}).desc ?? descFor(x.label)).find(d => d.length > 100);
-      if (long) return `Description too long (max 100): ${long}`;
+      if (long) return { msg: `Description too long (max 100): ${long}`, el: preview };
       if (fxAllowed && fxChk.checked) {
-        if (!(Number(fxPrice.value) > 0) || !(Number(fxRate.value) > 0) || !fxDate.value) return `${item.value}: fill in currency price, BNM rate and rate date.`;
-        if (!fxText.value.trim()) return `${item.value}: the FX comment is empty.`;
+        const miss = [[fxPrice, "currency price", Number(fxPrice.value) > 0], [fxRate, "BNM rate", Number(fxRate.value) > 0], [fxDate, "rate date", !!fxDate.value]].find(x => !x[2]);
+        if (miss) return { msg: `${item.value}: fill in the ${miss[1]}.`, el: miss[0] };
+        if (!fxText.value.trim()) return { msg: `${item.value}: the FX comment is empty.`, el: fxText };
       }
-      const ce = itemComments.validate();
-      if (ce.length) return `${item.value}: ${ce[0]}`;
+      const ce = itemComments.errs();
+      if (ce.length) return { msg: `${item.value}: ${ce[0].msg}`, el: ce[0].el };
       return null;
     };
     blk.lines = () => {
@@ -2036,11 +2116,12 @@ function buildOrder(key) {
 
     blk.refresh = drawVat;
     blk.items = () => [item.value];
-    blk.validate = () => {
-      if (!item.value) return "Every line needs a part no.";
-      if (desc.value.trim().length > 100) return "Description too long (max 100).";
-      const ce = itemComments.validate();
-      if (ce.length) return `${item.value}: ${ce[0]}`;
+    blk.itemEl = item.el;
+    blk.validate = () => {   // -> { msg, el } or null
+      if (!item.value) return { msg: "Every line needs a part no.", el: item.el };
+      if (desc.value.trim().length > 100) return { msg: "Description too long (max 100).", el: desc };
+      const ce = itemComments.errs();
+      if (ce.length) return { msg: `${item.value}: ${ce[0].msg}`, el: ce[0].el };
       return null;
     };
     blk.lines = () => [{ lineType: "Item", item: item.value, description: desc.value.trim(), qty: qty.value.trim(), cost: price.value.trim(),
@@ -2154,7 +2235,7 @@ function buildOrder(key) {
   }
 
   const previewBtn = h("button", { type: "submit" }, "Preview");
-  const form = h("form", {},
+  const form = autoClearMarks(h("form", { novalidate: true },
     h("div", { class: "grid" },
       h("label", {}, def.partyLabel, party.el),
       h("label", {}, "Order date", date),
@@ -2171,7 +2252,7 @@ function buildOrder(key) {
     h("div", { class: "row-actions", style: "margin-top:0" },
       bottomComments.btn),
     h("div", { class: "row-actions", style: "border-top:1px solid var(--line);padding-top:.75rem" }, previewBtn)
-  );
+  ));
   addBlock();
 
   /* ---- preview ---- */
@@ -2180,24 +2261,28 @@ function buildOrder(key) {
 
   async function buildPlan() {
     const errs = [];
-    if (!party.value) errs.push(`Choose a ${def.partyLabel.toLowerCase()}.`);
-    if (!orderVat.value) errs.push("Choose the VAT Bus. Posting Group for the order.");
-    if (!blocks.length) errs.push("Add at least one line.");
-    blocks.forEach(b => { const e = b.validate(); if (e) errs.push(e); });
-    errs.push(...bottomComments.validate());
-    if (errs.length) throw new Error(errs.join(" "));
+    const fail = () => { const e = new Error(errText(errs)); e.errs = errs; return e; };
+    if (!party.value) errs.push({ msg: `Choose a ${def.partyLabel.toLowerCase()}.`, el: party.el });
+    if (!orderVat.value) errs.push({ msg: "Choose the VAT Bus. Posting Group for the order.", el: orderVat });
+    if (!blocks.length) errs.push({ msg: "Add at least one line.", el: null });
+    blocks.forEach(b => { const e = b.validate(); if (e) errs.push(typeof e === "string" ? { msg: e, el: b.box } : e); });
+    errs.push(...bottomComments.errs());
+    if (errs.length) throw fail();
 
     const cls = lineClassification();
     const [parties, items, locations, extOk, clsOk] = await Promise.all([
       lookups[def.partyLookup](), lookups.items(), lookups.locations().catch(() => []), lineExtAvailable(key),
       cls ? lineClassAvailable(key) : Promise.resolve(false)]);
     const partyRec = parties.find(r => (r.number || "").toLowerCase() === party.value.toLowerCase());
-    if (!partyRec) throw new Error(`${def.partyLabel} "${party.value}" not found. Pick one from the search list.`);
+    if (!partyRec) { errs.push({ msg: `${def.partyLabel} "${party.value}" not found. Pick one from the search list.`, el: party.el }); throw fail(); }
     const itemMap = new Map(items.map(i => [String(i.number).toLowerCase(), i]));
     let dims = { plan: [], problems: [] };
     try { dims = await resolveDims(DIMENSIONS); } catch (e) { dims.problems.push("Dimensions: " + e.message); }
     const missing = [...new Set(blocks.flatMap(b => b.items()))].filter(n => !itemMap.has(n.toLowerCase()));
-    if (missing.length) throw new Error("Part no. not found in BC: " + missing.join(", "));
+    if (missing.length) {
+      blocks.forEach(b => { const n = b.items()[0]; if (n && missing.includes(n)) errs.push({ msg: `Part no. ${n} not found in BC.`, el: b.itemEl }); });
+      throw fail();
+    }
 
     const lines = [
       ...blocks.flatMap(b => b.lines()).map(l => {
@@ -2264,14 +2349,17 @@ function buildOrder(key) {
 
   form.addEventListener("submit", async ev => {
     ev.preventDefault();
-    previewBtn.disabled = true; setStatus("Checking...");
+    previewBtn.disabled = true; setStatus("Checking..."); clearMarks(form);
     try {
       plan = await buildPlan();
       const flagged = plan.lines.filter(l => l.flags.length).length;
       const notes = [flagged ? `${flagged} line(s) have notes` : "", plan.dimProblems.length ? `${plan.dimProblems.length} dimension(s) can't be set` : ""].filter(Boolean).join(", ");
       setStatus(notes ? `Preview ready – ${notes}. Check them, then Save to BC or go back.` : "Preview ready. Check it, then Save to BC.", notes ? "warn" : "ok");
       showPreview(plan);
-    } catch (e) { setStatus("Error: " + e.message, "err"); }
+    } catch (e) {
+      setStatus("Error: " + e.message, "err");
+      showErrors(form, e.errs || [{ msg: e.message }], previewBtn.parentElement);
+    }
     finally { previewBtn.disabled = false; }
   });
 
@@ -2392,12 +2480,14 @@ function buildOrder(key) {
       const w = [...new Set(ctx.warnings)];
       if (w.length) msg += " Warnings: " + w.slice(0, 5).join("; ") + (w.length > 5 ? ` (+${w.length - 5} more)` : "");
       setStatus(msg, w.length || ctx.vatPending || ctx.clsPending ? "warn" : "ok");
+      clearMarks(previewCard);
       plan = null; resetForm(); backToEdit();
       page = 0; refresh();
     } catch (e) {
       const extra = order ? ` (Draft ${order.number} was created with ${done} of ${lines.length} lines; open it in Business Central to fix or delete it.)` : "";
       setStatus("Error: " + e.message + extra, "err");
-      if (order) { plan = null; backToEdit(); refresh(); }
+      if (order) { plan = null; backToEdit(); refresh(); showErrors(form, [{ msg: "BC stopped the save: " + e.message + extra }], previewBtn.parentElement); }
+      else showErrors(previewCard, [{ msg: "BC did not accept the order: " + e.message }], saveBtn.parentElement);
     } finally { saveBtn.disabled = false; }
   }
 
