@@ -279,6 +279,20 @@ function lineExtAvailable(kind) {
   return extState[k];
 }
 
+/* MyInvois classification on PO / SO item lines (MY entity only, Saxon Portal API v1.5) */
+function lineClassification() {
+  const c = SETTINGS.lineClassification, g = companyGroup();
+  if (!c || !c.code || !g || !(c.groups || ["MY"]).includes(g)) return null;
+  return { code: String(c.code), desc: String(c.description || "") };
+}
+const clsLabel = c => c ? `${c.code} – ${c.desc}` : "";
+function lineClassAvailable(kind) {
+  const k = companyId + "|" + kind + "|cls";
+  if (!(k in extState)) extState[k] = lineExtAvailable(kind).then(ok => !ok ? false :
+    bcFetch(extBase(kind) + "?$top=1&$select=id,classificationCode,classificationDescription").then(() => true, () => false));
+  return extState[k];
+}
+
 /* ---------- tiny DOM helper ---------- */
 function h(tag, attrs = {}, ...kids) {
   const el = document.createElement(tag);
@@ -414,6 +428,18 @@ const MASTER = {
       { key: "country", label: "Country code (e.g. MY)", upper: true },
       { key: "paymentTerms", label: "Payment Terms Code", kind: "paymentTerms" }
     ],
+    // card fields this tab does NOT write – listed in the preview so nothing is hidden
+    notSet: [
+      { label: "Currency Code", note: grp => `blank = local currency${grp ? " (" + ({ MY: "MYR", SG: "SGD" })[grp] + ")" : ""}` },
+      { label: "Gen. Bus. Posting Group" },
+      { label: "Vendor Posting Group" },
+      { label: "VAT Bus. Posting Group" },
+      { label: "Registration Number" },
+      { label: "Tax Identification No. (TIN)", groups: ["MY"] },
+      { label: "ID Type", groups: ["MY"] },
+      { label: "ID No.", groups: ["MY"] },
+      { label: "Bank account" }
+    ],
     columns: [["number","Supplier ID"],["displayName","Name"],["email","Email"],["phoneNumber","Phone"],["city","City"]]
   },
   customers: {
@@ -435,6 +461,10 @@ const MASTER = {
       { key: "idNo", label: "ID No.", ext: true, upper: true }
     ],
     noteAuto: "Customer ID is given automatically by BC.",
+    notSet: [
+      { label: "Currency Code", note: grp => `blank = local currency${grp ? " (" + ({ MY: "MYR", SG: "SGD" })[grp] + ")" : ""}` },
+      { label: "VAT Bus. Posting Group" }
+    ],
     columns: [["number","Customer ID"],["displayName","Name"],["email","Email"],["phoneNumber","Phone"],["city","City"]]
   }
 };
@@ -580,6 +610,20 @@ function buildMaster(key) {
         if (bad.length) throw new Error("Email not valid: " + bad.join(", "));
         body.email = list.join(";"); shown.push([f.label, body.email]); continue;
       }
+      if (f.key === "country") {
+        // BC only accepts a Country/Region code (MY), not a name (MALAYSIA)
+        const want = v.toUpperCase();
+        let list = null;
+        try { list = await cached("countries", () => coAll("/countriesRegions?$select=code,displayName")); } catch {}
+        if (list) {
+          const byCode = list.find(c => String(c.code).toUpperCase() === want);
+          const byName = byCode ? null : list.find(c => normName(c.displayName) === normName(v));
+          if (byCode) { body.country = byCode.code; shown.push([f.label, `${byCode.code} – ${byCode.displayName || ""}`]); continue; }
+          if (byName) { body.country = byName.code; shown.push([f.label, `${byName.code} – ${byName.displayName} (you typed “${v}”)`]); continue; }
+          throw new Error(`Country "${v}" is not a Country/Region code in BC. Type the code, e.g. MY or SG.`);
+        }
+        if (want.length > 10) throw new Error(`Country "${v}" is too long – type the code, e.g. MY.`);
+      }
       body[f.key] = f.type === "number" ? Number(v) : (f.upper ? v.toUpperCase() : v);
       shown.push([f.label, String(body[f.key])]);
     }
@@ -595,7 +639,11 @@ function buildMaster(key) {
     if (Object.keys(extBody).length && !(await lineExtAvailable(key)))
       warnings.push("The Saxon Portal API extension v1.3 is not installed yet, so posting groups and MyInvois fields will NOT be set – you would need to fill them in BC.");
     if (def.noteAuto) shown.unshift([def.fields[0].key === "displayName" ? "Customer ID" : "ID", "(given automatically by BC)"]);
-    return { body, extBody, series, shown, warnings };
+    // fields on the card that this tab does not write
+    const grp = companyGroup();
+    const notSet = (def.notSet || []).filter(n => !n.groups || n.groups.includes(grp))
+      .map(n => [n.label, typeof n.note === "function" ? n.note(grp) : (n.note || "")]);
+    return { body, extBody, series, shown, notSet, warnings };
   }
 
   function showPreview(p) {
@@ -607,7 +655,12 @@ function buildMaster(key) {
       h("div", { class: "tablewrap" }, h("table", {},
         h("thead", {}, h("tr", {}, h("th", {}, "Field"), h("th", {}, "Value written to BC"))),
         h("tbody", {}, p.shown.map(([k, v]) => h("tr", {}, h("td", {}, k),
-          h("td", { class: "wrap" }, v === "" ? h("span", { class: "muted" }, "(empty)") : v)))))),
+          h("td", { class: "wrap" }, v === "" ? h("span", { class: "muted" }, "(empty)") : v)))),
+        p.notSet && p.notSet.length ? h("tbody", {},
+          h("tr", {}, h("th", { colspan: 2, style: "padding-top:1rem" }, "Not set from this tab – left as BC creates them",
+            h("div", { class: "muted small", style: "font-weight:normal" }, "Blank on the new card unless BC fills them in itself. Check and complete them on the card in BC."))),
+          p.notSet.map(([k, note]) => h("tr", {}, h("td", {}, k),
+            h("td", { class: "wrap" }, h("span", { class: "tag warn" }, "not set"), note ? h("span", { class: "muted" }, " " + note) : "")))) : "")),
       h("div", { class: "row-actions" },
         h("button", { type: "button", class: "ghost", onclick: backToEdit }, "← Back to edit"),
         createBtn));
@@ -1847,8 +1900,10 @@ function buildOrder(key) {
     function drawPreview() {
       const rows = ticked();
       if (!rows.length) { preview.replaceChildren(h("p", { class: "muted small" }, "No periods ticked.")); return; }
+      const cls = lineClassification();
       preview.replaceChildren(h("table", { class: "lines" },
-        h("thead", {}, h("tr", {}, h("th", {}, "Description"), h("th", {}, "Quantity"), h("th", {}, def.priceLabel), h("th", {}, "VAT group"))),
+        h("thead", {}, h("tr", {}, h("th", {}, "Description"), h("th", {}, "Quantity"), h("th", {}, def.priceLabel), h("th", {}, "VAT group"),
+          cls ? [h("th", {}, "Classification Code"), h("th", {}, "Classification Description")] : "")),
         h("tbody", {}, rows.map(x => {
           const o = st.over[x.label] || (st.over[x.label] = {});
           const d = h("input", { value: o.desc ?? descFor(x.label), maxlength: "100" });
@@ -1857,7 +1912,8 @@ function buildOrder(key) {
           q.addEventListener("input", () => o.qty = q.value);
           const c = h("input", { type: "number", min: "0", step: "any", value: o.cost ?? cost.value, placeholder: "enter cost" });
           c.addEventListener("input", () => o.cost = c.value);
-          return h("tr", {}, h("td", {}, d), h("td", {}, q), h("td", {}, c), h("td", {}, lineVatSelect(o)));
+          return h("tr", {}, h("td", {}, d), h("td", {}, q), h("td", {}, c), h("td", {}, lineVatSelect(o)),
+            cls ? [h("td", { class: "muted", title: "MyInvois – fixed value" }, cls.code), h("td", { class: "muted", title: "MyInvois – fixed value" }, cls.desc)] : "");
         }))));
     }
     yy.addEventListener("input", redraw);
@@ -1970,7 +2026,10 @@ function buildOrder(key) {
         h("label", {}, "Location", rl.loc),
         h("label", {}, "Quantity", qty),
         h("label", {}, def.priceLabel, price),
-        h("label", {}, "VAT group", vatBox)),
+        h("label", {}, "VAT group", vatBox),
+        ...(() => { const cls = lineClassification(); return cls ? [
+          h("label", {}, "Classification Code", h("input", { value: cls.code, disabled: true, title: "MyInvois – fixed value" })),
+          h("label", {}, "Classification Description", h("input", { value: cls.desc, disabled: true, title: "MyInvois – fixed value" }))] : []; })()),
       itemComments.box,
       h("div", { style: "margin-top:.5rem" }, itemComments.btn));
     drawVat();
@@ -2128,8 +2187,10 @@ function buildOrder(key) {
     errs.push(...bottomComments.validate());
     if (errs.length) throw new Error(errs.join(" "));
 
-    const [parties, items, locations, extOk] = await Promise.all([
-      lookups[def.partyLookup](), lookups.items(), lookups.locations().catch(() => []), lineExtAvailable(key)]);
+    const cls = lineClassification();
+    const [parties, items, locations, extOk, clsOk] = await Promise.all([
+      lookups[def.partyLookup](), lookups.items(), lookups.locations().catch(() => []), lineExtAvailable(key),
+      cls ? lineClassAvailable(key) : Promise.resolve(false)]);
     const partyRec = parties.find(r => (r.number || "").toLowerCase() === party.value.toLowerCase());
     if (!partyRec) throw new Error(`${def.partyLabel} "${party.value}" not found. Pick one from the search list.`);
     const itemMap = new Map(items.map(i => [String(i.number).toLowerCase(), i]));
@@ -2151,12 +2212,13 @@ function buildOrder(key) {
           if (loc) locationId = loc.id; else flags.push(`location ${l.locationCode} not in BC`);
         } else flags.push("no location");
         if (!extOk) flags.push("VAT group to set in BC");
+        if (cls && !clsOk) flags.push("classification to set in BC");
         if (it.blocked === true) flags.push("item blocked");
-        return { ...l, item: it.number, uom: it.baseUnitOfMeasureCode || "", locationId, flags };
+        return { ...l, item: it.number, uom: it.baseUnitOfMeasureCode || "", locationId, cls, flags };
       }),
       ...bottomComments.lines().map(c => ({ ...c, flags: [] }))
     ];
-    return { partyRec, extOk, lines, dimPlan: dims.plan, dimProblems: dims.problems,
+    return { partyRec, extOk, clsOk, cls, lines, dimPlan: dims.plan, dimProblems: dims.problems,
       header: { [def.partyKey]: partyRec.number, ...(date.value ? { orderDate: date.value } : {}),
                 ...(ext && ext.value.trim() ? { [def.extKey]: ext.value.trim() } : {}) } };
   }
@@ -2179,18 +2241,19 @@ function buildOrder(key) {
           ...p.dimPlan.map(d => `${d.code} ${d.valueCode}`)].join(" · ")) : "",
         ...p.dimProblems.map(x => h("div", {}, h("span", { class: "tag warn" }, "Dimension will not be set"), " ", x))),
       h("div", { class: "tablewrap" }, h("table", {},
-        h("thead", {}, h("tr", {}, ["#", "Type", "No.", "Description", "Location", "Quantity", "UoM", def.priceLabel, "Line amount", "VAT group", "Check"].map(t => h("th", {}, t)))),
+        h("thead", {}, h("tr", {}, ["#", "Type", "No.", "Description", "Location", "Quantity", "UoM", def.priceLabel, "Line amount", "VAT group",
+          ...(p.cls ? ["Classification Code", "Classification Description"] : []), "Check"].map(t => h("th", {}, t)))),
         h("tbody", {}, p.lines.map((l, i) => l.lineType === "Comment"
-          ? h("tr", { class: "comment" }, h("td", {}, i + 1), h("td", {}, "Comment"), h("td", {}, ""), h("td", { colspan: 8, class: "wrap" }, l.description), h("td", {}, ""))
+          ? h("tr", { class: "comment" }, h("td", {}, i + 1), h("td", {}, "Comment"), h("td", {}, ""), h("td", { colspan: p.cls ? 10 : 8, class: "wrap" }, l.description), h("td", {}, ""))
           : h("tr", {},
               h("td", {}, i + 1), h("td", {}, "Item"), h("td", {}, l.item), h("td", { class: "wrap" }, l.description || h("span", { class: "muted" }, "(from item card)")),
               h("td", {}, l.locationCode), h("td", { class: "num" }, l.qty === "" ? "–" : fmtNum(l.qty)), h("td", {}, l.uom),
               h("td", { class: "num" }, l.cost === "" ? "–" : fmtNum(l.cost)), h("td", { class: "num" }, l.qty && l.cost ? amt(l).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : "–"),
-              h("td", {}, l.vat), h("td", {}, l.flags.length ? l.flags.map(f => h("span", { class: "tag warn" }, f)) : h("span", { class: "tag ok" }, "OK"))))),
+              h("td", {}, l.vat), p.cls ? [h("td", {}, l.cls.code), h("td", {}, l.cls.desc)] : "", h("td", {}, l.flags.length ? l.flags.map(f => h("span", { class: "tag warn" }, f)) : h("span", { class: "tag ok" }, "OK"))))),
         h("tfoot", {}, h("tr", {}, h("td", { colspan: 5, class: "num" }, h("b", {}, "Total")),
           h("td", { class: "num" }, h("b", {}, fmtNum(round5(totalQty)))), h("td", {}, ""),
           h("td", { class: "num muted" }, "excl. VAT"),
-          h("td", { class: "num" }, h("b", {}, total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }))), h("td", { colspan: 2 }, ""))))),
+          h("td", { class: "num" }, h("b", {}, total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }))), h("td", { colspan: p.cls ? 4 : 2 }, ""))))),
       h("div", { class: "row-actions" },
         h("button", { type: "button", class: "ghost", onclick: backToEdit }, "← Back to edit"),
         saveBtn));
@@ -2285,13 +2348,25 @@ function buildOrder(key) {
         } catch (e) { ctx.vatPending++; ctx.warnings.push(`VAT group ${l.vat}: ${e.message}`); }
       } else ctx.vatPending++;
     }
+
+    // MyInvois classification (MY entity only) – fixed values from presets.js
+    if (l.cls) {
+      if (ctx.clsOk) {
+        try {
+          await bcFetch(`${extBase(key)}(${line.id})`, { method: "PATCH", headers: { "If-Match": "*" },
+            body: JSON.stringify({ classificationCode: l.cls.code, classificationDescription: l.cls.desc }) });
+          ctx.clsSet++;
+        } catch (e) { ctx.clsPending++; ctx.warnings.push(`Classification ${l.cls.code}: ${e.message}`); }
+      } else ctx.clsPending++;
+    }
   }
 
   const saveBtn = h("button", { type: "button", onclick: save }, "Save to BC");
   async function save() {
     if (!plan) return;
     saveBtn.disabled = true;
-    const ctx = { warnings: [...plan.dimProblems], vatSet: 0, vatPending: 0, extOk: plan.extOk, dimPlan: plan.dimPlan };
+    const ctx = { warnings: [...plan.dimProblems], vatSet: 0, vatPending: 0, extOk: plan.extOk, dimPlan: plan.dimPlan,
+                  clsSet: 0, clsPending: 0, clsOk: plan.clsOk };
     let order = null, done = 0;
     const lines = plan.lines;
     try {
@@ -2312,9 +2387,11 @@ function buildOrder(key) {
       let msg = `Saved draft ${order.number} with ${done} line(s).`;
       if (ctx.vatSet) msg += ` VAT group set on ${ctx.vatSet} line(s).`;
       if (ctx.vatPending) msg += ` VAT group to set in BC on ${ctx.vatPending} line(s).`;
+      if (ctx.clsSet) msg += ` Classification set on ${ctx.clsSet} line(s).`;
+      if (ctx.clsPending) msg += ` Classification (${clsLabel(plan.cls)}) to set in BC on ${ctx.clsPending} line(s).`;
       const w = [...new Set(ctx.warnings)];
       if (w.length) msg += " Warnings: " + w.slice(0, 5).join("; ") + (w.length > 5 ? ` (+${w.length - 5} more)` : "");
-      setStatus(msg, w.length || ctx.vatPending ? "warn" : "ok");
+      setStatus(msg, w.length || ctx.vatPending || ctx.clsPending ? "warn" : "ok");
       plan = null; resetForm(); backToEdit();
       page = 0; refresh();
     } catch (e) {

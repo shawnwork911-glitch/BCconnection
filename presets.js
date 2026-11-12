@@ -100,6 +100,10 @@ window.PORTAL_PRESETS = {
     localCurrency: { MY: "MYR", SG: "SGD" }   // vendor currency is left blank when the deal is in this
   },
 
+  // MyInvois classification on every ITEM line of a PO / SO (needs Saxon Portal API v1.5).
+  // Only applied in the entities listed in "groups" (MY = Saxon Renewable Energy Sdn Bhd).
+  lineClassification: { groups: ["MY"], code: "022", description: "Others" },
+
   // Defaults for new part numbers (Costs & Posting)
   itemDefaults: { generalProductPostingGroupCode: "RECS", inventoryPostingGroupCode: "RECS" },
 
