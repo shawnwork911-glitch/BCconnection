@@ -97,12 +97,16 @@ window.PORTAL_PRESETS = {
     idTypes: [ { code: "NRIC" }, { code: "PASSPORT" }, { code: "BRN" }, { code: "Army" } ],
     defaults: { genBusLocal: "LOCAL", genBusOverseas: "OVERSEAS", vendorPostingGroup: "TRADE",
                 vatBusLocal: "LOCAL", vatBusOverseas: "EXPORT" },
+    // Supplier tab: starting values of the 3 posting-group dropdowns, by Supplier ID number series
+    // and by entity (MY / SG, see companyGroups). The user can still change them. Series not listed start empty.
+    seriesDefaults: {
+      "PP-VENNO1": {
+        SG: { genBusPostingGroup: "LOCAL", vendorPostingGroup: "TRADE", vatBusPostingGroup: "PURCH-ZP" },
+        MY: { genBusPostingGroup: "LOCAL", vendorPostingGroup: "TRADE", vatBusPostingGroup: "LOCAL" }
+      }
+    },
     localCurrency: { MY: "MYR", SG: "SGD" }   // vendor currency is left blank when the deal is in this
   },
-
-  // MyInvois classification on every ITEM line of a PO / SO (needs Saxon Portal API v1.5).
-  // Only applied in the entities listed in "groups" (MY = Saxon Renewable Energy Sdn Bhd).
-  lineClassification: { groups: ["MY"], code: "022", description: "Others" },
 
   // Defaults for new part numbers (Costs & Posting)
   itemDefaults: { generalProductPostingGroupCode: "RECS", inventoryPostingGroupCode: "RECS" },
