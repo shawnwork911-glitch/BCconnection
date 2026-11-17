@@ -2258,8 +2258,9 @@ function buildOrder(key) {
      A dimension is only used if it really has the wanted value (e.g. Z_NA). */
   async function resolveDims(dims) {
     const plan = [], problems = [];
-    const onHeader = Object.values(SETTINGS.headerDimensionNames || {}).map(normName);
-    const wanted = Object.entries(dims || {}).filter(([name]) => !onHeader.includes(normName(name)));
+    // Cost center / Business line are ALSO written on every line (not only the header), because the
+    // header value is not always inherited by lines created through the API (lines came out blank).
+    const wanted = Object.entries(dims || {});
     if (!wanted.length) return { plan, problems };
     const all = await lookups.dimensions();
     for (const [name, val] of wanted) {
