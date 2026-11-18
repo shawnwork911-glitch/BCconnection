@@ -150,7 +150,7 @@ const CONFIG = {
   // Drafts, uploads and Notify Finance keep working. allowedPosters: when not empty, ONLY these sign-in emails may post
   // (when locked is false). This is a soft lock inside the file - the real access control is the Entra app's
   // "Assignment required" setting and BC permissions.
-  postingLock: { locked: True, message: "Posting is switched off at the moment. Save a draft and ask the administrator to post it.", allowedPosters: [] },
+  postingLock: { locked: false, message: "Posting is switched off at the moment. Save a draft and ask the administrator to post it.", allowedPosters: [] },
 
   // "Deal orders" tab: approved Stock-In deal -> draft PO, Stock-Out deal -> draft SO (created by a button click)
   dealOrders: {
