@@ -495,6 +495,7 @@ const TABS = [
   { id: "approvals", label: "Approvals",   build: () => buildApprovals(), when: () => CONFIG.features.approvals }
 ].filter(t => !t.when || t.when());
 const refreshers = {};
+const orderPosters = {};   // "po" / "so" -> postReceiveShip(order, say): receive (PO) / ship (SO) only, never invoice
 const orderCreators = {};   // "po" / "so" -> createDraftFromSpec(spec, hooks), registered by buildOrder, used by the Deal orders tab   // tab id -> function that reloads its list
 
 /* ---------- master data tab ---------- */
@@ -2218,7 +2219,7 @@ function buildOrder(key) {
     const dimText = Object.entries(DIMENSIONS).map(([k, v]) => `${k} ${v}`).join(" · ");
     previewCard.replaceChildren(
       h("div", { class: "card-head" }, h("h2", {}, `Preview – draft ${def.title.replace(/s$/, "")}`),
-        h("span", { class: "tag" }, "Nothing is written to BC until you click Save")),
+        h("span", { class: "tag" }, "Nothing is written to BC until you click Save draft or Save and post")),
       h("div", { class: "party-info", style: "margin:0 0 .75rem" },
         h("div", {}, h("b", {}, `${p.partyRec.number} — ${p.partyRec.displayName || ""}`)),
         h("div", {}, `Company: ${companyName()} · Order date and Document date: ${date.value ? shortDate(date.value) : "(today)"} · VAT group: ${orderVat.value}` +
@@ -2244,7 +2245,7 @@ function buildOrder(key) {
           h("td", { class: "num" }, h("b", {}, total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }))), h("td", { colspan: 2 }, ""))))),
       h("div", { class: "row-actions" },
         h("button", { type: "button", class: "ghost", onclick: backToEdit }, "← Back to edit"),
-        saveBtn));
+        saveBtn, savePostBtn));
     form.classList.add("hidden"); previewCard.classList.remove("hidden");
     previewCard.scrollIntoView({ behavior: "smooth", block: "start" });
   }
@@ -2339,10 +2340,12 @@ function buildOrder(key) {
     }
   }
 
-  const saveBtn = h("button", { type: "button", onclick: save }, "Save to BC");
-  async function save() {
+  const saveBtn = h("button", { type: "button", onclick: () => save(false) }, "Save draft");
+  const savePostBtn = h("button", { type: "button", class: "ghost", onclick: () => save(true) }, `Save and post (${def.stepVerb})`);
+  async function save(doPost) {
     if (!plan) return;
-    saveBtn.disabled = true;
+    if (doPost && !confirm(`Save the draft and then ${def.stepVerb} it (post) in Business Central?\n\nPosting ${def.stepVerb}s the stock and cannot be undone from this portal. Invoicing stays a separate step for Finance.`)) return;
+    saveBtn.disabled = savePostBtn.disabled = true;
     const ctx = { warnings: [...plan.dimProblems], vatSet: 0, vatPending: 0, extOk: plan.extOk, dimPlan: plan.dimPlan };
     let order = null, done = 0;
     const lines = plan.lines;
@@ -2369,19 +2372,22 @@ function buildOrder(key) {
         await createLine(order, l, ctx);
         done++;
       }
+      let posted = null, postErr = "";
+      if (doPost) { try { posted = await postReceiveShip(order, setStatus); } catch (e) { postErr = e.message; } }
       let msg = `Saved draft ${order.number} with ${done} line(s).`;
       if (ctx.vatSet) msg += ` VAT group set on ${ctx.vatSet} line(s).`;
       if (ctx.vatPending) msg += ` VAT group to set in BC on ${ctx.vatPending} line(s).`;
+      if (doPost) msg += postErr ? ` The draft was saved but posting failed: ${postErr} Fix it in Business Central or post it from there.` : posted && posted.nothing ? " Nothing left to post." : ` Posted – ${def.stepPast}.`;
       const w = [...new Set(ctx.warnings)];
       if (w.length) msg += " Warnings: " + w.slice(0, 5).join("; ") + (w.length > 5 ? ` (+${w.length - 5} more)` : "");
-      setStatus(msg, w.length || ctx.vatPending ? "warn" : "ok");
+      setStatus(msg, w.length || ctx.vatPending || postErr ? "warn" : "ok");
       plan = null; resetForm(); backToEdit();
       page = 0; refresh();
     } catch (e) {
       const extra = order ? ` (Draft ${order.number} was created with ${done} of ${lines.length} lines; open it in Business Central to fix or delete it.)` : "";
       setStatus("Error: " + e.message + extra, "err");
       if (order) { plan = null; backToEdit(); refresh(); }
-    } finally { saveBtn.disabled = false; }
+    } finally { saveBtn.disabled = savePostBtn.disabled = false; }
   }
 
   /* ---- used by the "Deal orders" tab: the same creation steps as Save, but from a ready-made spec ----
@@ -2438,6 +2444,26 @@ function buildOrder(key) {
       return { order, ctx, done };
     } catch (e) { e.order = order; e.done = done; throw e; }
   }
+  /* Post = receive (PO) / ship (SO) ONLY. Invoicing / payment is Finance's next step (AP Request system).
+     Sets the quantity to receive / ship on every open line, quantity to invoice 0, then runs BC's post action.
+     Returns { posted: n } or { nothing: true } when everything was already received / shipped. Posting cannot be undone from here. */
+  async function postReceiveShip(order, say) {
+    say && say(`${order.number}: reading the lines...`);
+    const o = await co(`/${def.endpoint}(${order.id})?$expand=${def.linesEndpoint}`);
+    const lines = (o[def.linesEndpoint] || []).filter(l => l.lineType === "Item" && num(l.quantity) > 0);
+    if (!lines.length) throw new Error(`${order.number} has no quantity to ${def.stepVerb}.`);
+    const todo = lines.filter(l => num(l.quantity) > num(l[def.doneQtyKey]));
+    if (!todo.length) return { nothing: true };
+    for (let i = 0; i < todo.length; i++) {
+      say && say(`${order.number}: preparing line ${i + 1} of ${todo.length} to ${def.stepVerb}...`);
+      await patchLine(order, todo[i], { [def.stepQtyKey]: num(todo[i].quantity) - num(todo[i][def.doneQtyKey]) });
+      await patchLine(order, todo[i], { invoiceQuantity: 0 });
+    }
+    say && say(`${order.number}: posting (${def.stepVerb})...`);
+    await co(`/${def.endpoint}(${order.id})/Microsoft.NAV.${def.postAction}`, { method: "POST", headers: { "If-Match": "*" }, body: "{}" });
+    return { posted: todo.length };
+  }
+  orderPosters[key] = postReceiveShip;
   orderCreators[key] = createDraftFromSpec;
 
   /* ---- posting (switched off: CONFIG.features.posting) ---- */
@@ -2559,7 +2585,8 @@ const DOCOL = { ref: "Title", source: "Source", entity: "Entity", type: "Order T
   company: "BC Company", status: "Status", by: "Created By", date: "Created Date",
   party: "Counterparty", files: "Files Attached", note: "Note", notified: "Finance Notified",
   finBy: "Finance Notified By", finNote: "Finance Note", handledBy: "Finance Handled By", handledDate: "Finance Handled Date",
-  lastUpload: "Last Upload Date", pending: "Files Pending BC" };
+  lastUpload: "Last Upload Date", pending: "Files Pending BC", postedBy: "Posted By", postedDate: "Posted Date" };
+const DO_POST_COLS = ["Posted By", "Posted Date"];
 const DO_NEW_COLS = ["Finance Notified", "Finance Notified By", "Finance Note", "Finance Handled By", "Finance Handled Date", "Last Upload Date", "Files Pending BC"];
 const DO_REQUIRED = ["Source", "Entity", "Order Type", "BC Order No.", "BC Order Id", "BC Company", "Status", "Created By", "Created Date"];
 const DO_STATUS = { created: "Created", interrupted: "Interrupted" };
@@ -2759,6 +2786,8 @@ function buildDealOrders() {
       linksCtx = await doList(); links = await spItems(linksCtx);
       const miss = DO_NEW_COLS.filter(d => !linksCtx.col[d]);
       if (miss.length) notes.push(`The list ${DO().listName} needs these extra columns (Single line of text) for uploads and Finance notices: ${miss.join(", ")}.`);
+      const missPost = DO_POST_COLS.filter(d => !linksCtx.col[d]);
+      if (missPost.length) notes.push(`Add these columns (Single line of text) to ${DO().listName} to use the Post buttons: ${missPost.join(", ")}.`);
     }
     catch (e) { notes.push(`Deal order list: ${e.message} Create it on the Operations site with these Single-line-of-text columns: ${DO_REQUIRED.join(", ")} (optional: ${[DOCOL.party, DOCOL.files, DOCOL.note, DOCOL.notified].join(", ")}). The list title holds the Agreement ID. Orders cannot be created until it exists.`); }
     try { register = await spItems(await regList()); } catch (e) { register = []; notes.push("Register: " + e.message); }
@@ -2820,8 +2849,9 @@ function buildDealOrders() {
     const made = links.filter(l => normName(fv(l, DOCOL.company)) === normName(companyName()) && fv(l, DOCOL.status) === DO_STATUS.created)
       .sort((a, b) => Number(b.id) - Number(a.id)).slice(0, 100);
     const colsOk = !!linksCtx && DO_NEW_COLS.every(d => linksCtx.col[d]);
+    const postColsOk = !!linksCtx && DO_POST_COLS.every(d => linksCtx.col[d]);
     createdBox.replaceChildren(!made.length ? h("p", { class: "muted" }, "No orders created from deals yet.") : h("table", {},
-      h("thead", {}, h("tr", {}, ["Order", "Deal ID", "Counterparty", "Created", "Files in BC", "Waiting for BC", "Finance", ""].map(x => h("th", {}, x)))),
+      h("thead", {}, h("tr", {}, ["Order", "Deal ID", "Counterparty", "Created", "Files in BC", "Waiting for BC", "Posting", "Finance", ""].map(x => h("th", {}, x)))),
       h("tbody", {}, made.map(l => {
         const type = fv(l, DOCOL.type), no = fv(l, DOCOL.no), d = new Date(fv(l, DOCOL.date));
         const inBc = splitNames(fv(l, DOCOL.files)), waiting = splitNames(fv(l, DOCOL.pending));
@@ -2830,8 +2860,10 @@ function buildDealOrders() {
           h("td", {}, isNaN(d) ? "" : fmtDate(d)),
           h("td", { class: "wrap small", title: inBc.join("\n") }, inBc.length ? `${inBc.length} file(s)` : h("span", { class: "muted" }, "none")),
           h("td", { class: "wrap small" }, waiting.length ? h("span", { class: "tag warn", title: waiting.join("\n") }, `${waiting.length} file(s)`) : ""),
+          h("td", { class: "wrap small" }, fv(l, DOCOL.postedDate) ? h("span", { class: "tag ok" }, `Posted ${fv(l, DOCOL.postedDate).slice(0, 10)} by ${fv(l, DOCOL.postedBy)}`) : h("span", { class: "tag" }, "Draft")),
           h("td", { class: "wrap" }, financeCell(l)),
           h("td", {}, h("span", { class: "row-actions", style: "margin:0;flex-wrap:wrap" },
+            fv(l, DOCOL.postedDate) ? "" : h("button", { type: "button", class: "small", disabled: busy || !postColsOk, title: postColsOk ? "" : "Add the Posted By / Posted Date columns first", onclick: () => postRow(l) }, `Post (${ORDERS[type.toLowerCase()].stepVerb})`),
             h("button", { type: "button", class: "small", disabled: busy || !colsOk, onclick: () => { pickFor = l; picker.click(); } }, "Upload files"),
             h("button", { type: "button", class: "small ghost", disabled: busy || !colsOk, onclick: () => syncFiles(l) }, waiting.length ? "Retry files" : "Sync files"),
             h("button", { type: "button", class: "small" + (fv(l, DOCOL.notified) ? " ghost" : ""), disabled: busy || !colsOk, onclick: () => notifyFinance(l) }, "Notify Finance"))));
@@ -2908,10 +2940,27 @@ function buildDealOrders() {
     finally { busy = false; refresh(); }
   }
 
+  /* Post (receive / ship) a draft that is already in BC. Invoicing stays Finance's step. */
+  async function postRow(l) {
+    const type = fv(l, DOCOL.type).toLowerCase(), no = fv(l, DOCOL.no), def = ORDERS[type];
+    if (!confirm(`${def.stepLabel} ${no} in Business Central (post)?\n\nThis ${def.stepVerb}s the stock and cannot be undone from this portal. Invoicing stays a separate step for Finance.`)) return;
+    busy = true; draw();
+    try {
+      setStatus(`${no}: checking the order in BC...`);
+      const order = await openDraft(l);
+      const r = await orderPosters[type](order, setStatus);
+      await spWrite(linksCtx, l.id, { [DOCOL.postedBy]: account.username, [DOCOL.postedDate]: new Date().toISOString() }, null);
+      setStatus(r.nothing ? `${no} was already ${def.stepPast} in BC – recorded as posted.` : `${no} ${def.stepPast}. Press Notify Finance when it is ready for their next step.`, "ok");
+    } catch (e) { setStatus(`Could not ${def.stepVerb} ${no}: ${e.message}`, "err"); }
+    finally { busy = false; refresh(); }
+  }
+
   /* Notify Finance: a recorded notice (no email). A new notice clears an earlier "handled", so it returns to Finance's waiting list. */
   async function notifyFinance(l) {
     const no = fv(l, DOCOL.no);
-    const text = window.prompt(`Note for Finance about ${no} (optional), e.g. "SO posted in BC, please raise the invoice":`, "");
+    const isSO = fv(l, DOCOL.type) === "SO";
+    const suggestion = fv(l, DOCOL.postedDate) ? (isSO ? "SO shipped in BC, please raise the invoice" : "PO received in BC, please check the vendor invoice and arrange payment") : "";
+    const text = window.prompt(`Note for Finance about ${no} (optional):`, suggestion);
     if (text === null) return;
     busy = true; draw();
     try {
@@ -2961,16 +3010,20 @@ function buildDealOrders() {
       }), isPO && !poAttachOk ? h("div", { class: "muted small", style: "margin-top:.3rem" }, h("span", { class: "tag warn" }, "Saxon Portal API v1.6 not found"), " BC cannot take attachments on purchase orders without it. The file names will be written as comment lines on the PO instead.") : "");
     }).catch(e => filesBox.replaceChildren("Could not read the files from SharePoint: " + e.message));
 
-    const createBtn = h("button", { type: "button" }, `Create draft ${isPO ? "Purchase Order" : "Sales Order"}`);
-    createBtn.addEventListener("click", create);
+    const postOk = DO_POST_COLS.every(d => linksCtx && linksCtx.col[d]);
+    const createBtn = h("button", { type: "button" }, `Save draft ${isPO ? "Purchase Order" : "Sales Order"}`);
+    const createPostBtn = h("button", { type: "button", class: "ghost", disabled: !postOk, title: postOk ? "" : `Add the columns ${DO_POST_COLS.join(" and ")} to the ${DO().listName} list first` }, `Save and post (${def.stepVerb})`);
+    createBtn.addEventListener("click", () => create(false));
+    createPostBtn.addEventListener("click", () => create(true));
 
-    async function create() {
+    async function create(doPost) {
       const errs = [];
       if (!partyBox.value) errs.push(`Choose the ${def.partyLabel.toLowerCase()}.`);
       if (!vat.value) errs.push("Choose the VAT Bus. Posting Group.");
       rows.forEach((r, i) => { if (!r.item.value) errs.push(`Line ${i + 1}: choose the part number.`); if (!(Number(r.qty.value) > 0)) errs.push(`Line ${i + 1}: quantity is needed.`); });
       if (errs.length) { setStatus(errs.join(" "), "err"); return; }
-      busy = true; createBtn.disabled = true;
+      if (doPost && !confirm(`Save the draft ${isPO ? "PO" : "SO"} for deal ${g.ref} and then ${def.stepVerb} it (post) in Business Central?\n\nPosting ${def.stepVerb}s the stock and cannot be undone from this portal. Invoicing stays a separate step for Finance.`)) return;
+      busy = true; createBtn.disabled = createPostBtn.disabled = true;
       let row = null, order = null;
       try {
         setStatus("Checking that this deal has no order yet...");
@@ -2999,13 +3052,18 @@ function buildDealOrders() {
           else if (r.failed.length) notes.push("Files not attached: " + r.failed.slice(0, 3).join("; "));
         }
         if (made.ctx.vatPending) notes.push(`VAT group to set in BC on ${made.ctx.vatPending} line(s).`);
-        await spWrite(linksCtx, row.id, { [DOCOL.status]: DO_STATUS.created, [DOCOL.files]: attachedNames.join("; ").slice(0, 250), [DOCOL.note]: notes.join(" ").slice(0, 250) }, null);
-        setStatus(`Saved draft ${order.number} for deal ${g.ref} with ${made.done} line(s)` + (attachedNames.length ? ` and ${attachedNames.length} file(s).` : ".") + (notes.length ? " Check: " + notes.slice(0, 3).join(" ") : ""), notes.length ? "warn" : "ok");
+        let posted = null, postErr = "";
+        if (doPost) { try { posted = await orderPosters[key](order, setStatus); } catch (e) { postErr = e.message; notes.push(`Posting failed: ${e.message}`); } }
+        const postFields = doPost && !postErr ? { [DOCOL.postedBy]: account.username, [DOCOL.postedDate]: new Date().toISOString() } : {};
+        await spWrite(linksCtx, row.id, { [DOCOL.status]: DO_STATUS.created, [DOCOL.files]: attachedNames.join("; ").slice(0, 250), [DOCOL.note]: notes.join(" ").slice(0, 250), ...postFields }, null);
+        setStatus(`Saved draft ${order.number} for deal ${g.ref} with ${made.done} line(s)` + (attachedNames.length ? ` and ${attachedNames.length} file(s).` : ".") +
+          (doPost ? (postErr ? ` Posting failed (the draft is saved): ${postErr}` : posted && posted.nothing ? " Nothing left to post." : ` Posted – ${def.stepPast}. Press Notify Finance when ready.`) : "") +
+          (notes.filter(n => !n.startsWith("Posting failed")).length ? " Check: " + notes.filter(n => !n.startsWith("Posting failed")).slice(0, 3).join(" ") : ""), notes.length ? "warn" : "ok");
         reviewBox.replaceChildren(); openKey = null;
       } catch (e) {
         const ord = e.order || order;
         setStatus("Error: " + e.message + (ord ? ` (Draft ${ord.number} was created with ${e.done || 0} line(s); open it in Business Central to finish or delete it. The deal stays marked "Interrupted" until you delete its row in the ${DO().listName} list.)` : ""), "err");
-      } finally { busy = false; createBtn.disabled = false; refresh(); }
+      } finally { busy = false; createBtn.disabled = createPostBtn.disabled = false; refresh(); }
     }
 
     return h("div", { class: "card" },
@@ -3026,7 +3084,7 @@ function buildDealOrders() {
       h("h3", { style: "margin:1rem 0 .4rem;font-size:.9rem" }, "Deal files to attach to the order"),
       filesBox,
       h("div", { class: "row-actions", style: "border-top:1px solid var(--line);padding-top:.75rem" },
-        createBtn, h("span", { class: "muted small" }, "Creates a DRAFT only. It is not received, shipped or posted.")));
+        createBtn, createPostBtn, h("span", { class: "muted small" }, `Save draft: nothing is ${def.stepPast} or posted. Save and post: ${def.stepVerb}s it in BC (no invoice – that is Finance's step).`)));
   }
 
   return h("div", {},
