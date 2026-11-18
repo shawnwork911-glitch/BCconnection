@@ -145,6 +145,13 @@ const CONFIG = {
     registerListId:   "acafe2f9-dcbe-4864-a2c3-8a2c1a52ee0c"  // its ID (List settings URL); blank = find it by name
   },
 
+  // POSTING LOCK: posting (receive / ship) cannot be undone from the portal. Set locked: true before you are away
+  // (then re-publish the file): every Save and post / Post button is disabled for everyone, and the code refuses to post.
+  // Drafts, uploads and Notify Finance keep working. allowedPosters: when not empty, ONLY these sign-in emails may post
+  // (when locked is false). This is a soft lock inside the file - the real access control is the Entra app's
+  // "Assignment required" setting and BC permissions.
+  postingLock: { locked: True, message: "Posting is switched off at the moment. Save a draft and ask the administrator to post it.", allowedPosters: [] },
+
   // "Deal orders" tab: approved Stock-In deal -> draft PO, Stock-Out deal -> draft SO (created by a button click)
   dealOrders: {
     // SharePoint list on the Operations site that remembers which deal became which BC order (setup checklist: see the tab)
@@ -495,6 +502,14 @@ const TABS = [
   { id: "approvals", label: "Approvals",   build: () => buildApprovals(), when: () => CONFIG.features.approvals }
 ].filter(t => !t.when || t.when());
 const refreshers = {};
+/* "" when the signed-in user may post, otherwise the reason (see CONFIG.postingLock) */
+function postingBlockedReason() {
+  const L = CONFIG.postingLock || {};
+  if (L.locked) return L.message || "Posting is switched off.";
+  const allowed = (L.allowedPosters || []).map(x => String(x).trim().toLowerCase()).filter(Boolean);
+  if (allowed.length && !(account && allowed.includes(String(account.username).toLowerCase()))) return "Only the people on the posting list can post. Save a draft and ask them to post it.";
+  return "";
+}
 const orderPosters = {};   // "po" / "so" -> postReceiveShip(order, say): receive (PO) / ship (SO) only, never invoice
 const orderCreators = {};   // "po" / "so" -> createDraftFromSpec(spec, hooks), registered by buildOrder, used by the Deal orders tab   // tab id -> function that reloads its list
 
@@ -2341,7 +2356,7 @@ function buildOrder(key) {
   }
 
   const saveBtn = h("button", { type: "button", onclick: () => save(false) }, "Save draft");
-  const savePostBtn = h("button", { type: "button", class: "ghost", onclick: () => save(true) }, `Save and post (${def.stepVerb})`);
+  const savePostBtn = h("button", { type: "button", class: "ghost", disabled: !!postingBlockedReason(), title: postingBlockedReason(), onclick: () => save(true) }, `Save and post (${def.stepVerb})`);
   async function save(doPost) {
     if (!plan) return;
     if (doPost && !confirm(`Save the draft and then ${def.stepVerb} it (post) in Business Central?\n\nPosting ${def.stepVerb}s the stock and cannot be undone from this portal. Invoicing stays a separate step for Finance.`)) return;
@@ -2387,7 +2402,7 @@ function buildOrder(key) {
       const extra = order ? ` (Draft ${order.number} was created with ${done} of ${lines.length} lines; open it in Business Central to fix or delete it.)` : "";
       setStatus("Error: " + e.message + extra, "err");
       if (order) { plan = null; backToEdit(); refresh(); }
-    } finally { saveBtn.disabled = savePostBtn.disabled = false; }
+    } finally { saveBtn.disabled = false; savePostBtn.disabled = !!postingBlockedReason(); }
   }
 
   /* ---- used by the "Deal orders" tab: the same creation steps as Save, but from a ready-made spec ----
@@ -2448,6 +2463,8 @@ function buildOrder(key) {
      Sets the quantity to receive / ship on every open line, quantity to invoice 0, then runs BC's post action.
      Returns { posted: n } or { nothing: true } when everything was already received / shipped. Posting cannot be undone from here. */
   async function postReceiveShip(order, say) {
+    const blocked = postingBlockedReason();
+    if (blocked) throw new Error(blocked);
     say && say(`${order.number}: reading the lines...`);
     const o = await co(`/${def.endpoint}(${order.id})?$expand=${def.linesEndpoint}`);
     const lines = (o[def.linesEndpoint] || []).filter(l => l.lineType === "Item" && num(l.quantity) > 0);
@@ -2832,6 +2849,7 @@ function buildDealOrders() {
       .filter(g => !q || g.ref.toLowerCase().includes(q) || g.company.toLowerCase().includes(q));
     note.replaceChildren(
       h("div", {}, `Showing ${g0 || "?"} deals for ${companyName()}. Stock-In deals become draft Purchase Orders, Stock-Out deals draft Sales Orders.`),
+      postingBlockedReason() ? h("div", {}, h("span", { class: "tag warn" }, "Posting locked"), " ", postingBlockedReason()) : "",
       ...loadNotes.map(n => h("div", {}, h("span", { class: "tag warn" }, "Check"), " ", n)));
     if (!g0) { pendingBox.replaceChildren(h("p", { class: "muted" }, "This company is not matched to MY or SG in presets.js (companyGroups).")); createdBox.replaceChildren(); return; }
     pendingBox.replaceChildren(!todo.length ? h("p", { class: "muted" }, "No approved deals waiting for an order.") : h("table", {},
@@ -2849,7 +2867,7 @@ function buildDealOrders() {
     const made = links.filter(l => normName(fv(l, DOCOL.company)) === normName(companyName()) && fv(l, DOCOL.status) === DO_STATUS.created)
       .sort((a, b) => Number(b.id) - Number(a.id)).slice(0, 100);
     const colsOk = !!linksCtx && DO_NEW_COLS.every(d => linksCtx.col[d]);
-    const postColsOk = !!linksCtx && DO_POST_COLS.every(d => linksCtx.col[d]);
+    const postColsOk = !!linksCtx && DO_POST_COLS.every(d => linksCtx.col[d]) && !postingBlockedReason();
     createdBox.replaceChildren(!made.length ? h("p", { class: "muted" }, "No orders created from deals yet.") : h("table", {},
       h("thead", {}, h("tr", {}, ["Order", "Deal ID", "Counterparty", "Created", "Files in BC", "Waiting for BC", "Posting", "Finance", ""].map(x => h("th", {}, x)))),
       h("tbody", {}, made.map(l => {
@@ -2863,7 +2881,7 @@ function buildDealOrders() {
           h("td", { class: "wrap small" }, fv(l, DOCOL.postedDate) ? h("span", { class: "tag ok" }, `Posted ${fv(l, DOCOL.postedDate).slice(0, 10)} by ${fv(l, DOCOL.postedBy)}`) : h("span", { class: "tag" }, "Draft")),
           h("td", { class: "wrap" }, financeCell(l)),
           h("td", {}, h("span", { class: "row-actions", style: "margin:0;flex-wrap:wrap" },
-            fv(l, DOCOL.postedDate) ? "" : h("button", { type: "button", class: "small", disabled: busy || !postColsOk, title: postColsOk ? "" : "Add the Posted By / Posted Date columns first", onclick: () => postRow(l) }, `Post (${ORDERS[type.toLowerCase()].stepVerb})`),
+            fv(l, DOCOL.postedDate) ? "" : h("button", { type: "button", class: "small", disabled: busy || !postColsOk, title: postColsOk ? "" : (postingBlockedReason() || "Add the Posted By / Posted Date columns first"), onclick: () => postRow(l) }, `Post (${ORDERS[type.toLowerCase()].stepVerb})`),
             h("button", { type: "button", class: "small", disabled: busy || !colsOk, onclick: () => { pickFor = l; picker.click(); } }, "Upload files"),
             h("button", { type: "button", class: "small ghost", disabled: busy || !colsOk, onclick: () => syncFiles(l) }, waiting.length ? "Retry files" : "Sync files"),
             h("button", { type: "button", class: "small" + (fv(l, DOCOL.notified) ? " ghost" : ""), disabled: busy || !colsOk, onclick: () => notifyFinance(l) }, "Notify Finance"))));
@@ -3010,9 +3028,10 @@ function buildDealOrders() {
       }), isPO && !poAttachOk ? h("div", { class: "muted small", style: "margin-top:.3rem" }, h("span", { class: "tag warn" }, "Saxon Portal API v1.6 not found"), " BC cannot take attachments on purchase orders without it. The file names will be written as comment lines on the PO instead.") : "");
     }).catch(e => filesBox.replaceChildren("Could not read the files from SharePoint: " + e.message));
 
-    const postOk = DO_POST_COLS.every(d => linksCtx && linksCtx.col[d]);
+    const lockWhy = postingBlockedReason();
+    const postOk = !lockWhy && DO_POST_COLS.every(d => linksCtx && linksCtx.col[d]);
     const createBtn = h("button", { type: "button" }, `Save draft ${isPO ? "Purchase Order" : "Sales Order"}`);
-    const createPostBtn = h("button", { type: "button", class: "ghost", disabled: !postOk, title: postOk ? "" : `Add the columns ${DO_POST_COLS.join(" and ")} to the ${DO().listName} list first` }, `Save and post (${def.stepVerb})`);
+    const createPostBtn = h("button", { type: "button", class: "ghost", disabled: !postOk, title: postOk ? "" : (lockWhy || `Add the columns ${DO_POST_COLS.join(" and ")} to the ${DO().listName} list first`) }, `Save and post (${def.stepVerb})`);
     createBtn.addEventListener("click", () => create(false));
     createPostBtn.addEventListener("click", () => create(true));
 
@@ -3063,7 +3082,7 @@ function buildDealOrders() {
       } catch (e) {
         const ord = e.order || order;
         setStatus("Error: " + e.message + (ord ? ` (Draft ${ord.number} was created with ${e.done || 0} line(s); open it in Business Central to finish or delete it. The deal stays marked "Interrupted" until you delete its row in the ${DO().listName} list.)` : ""), "err");
-      } finally { busy = false; createBtn.disabled = createPostBtn.disabled = false; refresh(); }
+      } finally { busy = false; createBtn.disabled = false; createPostBtn.disabled = !postOk; refresh(); }
     }
 
     return h("div", { class: "card" },
