@@ -129,7 +129,8 @@ const CONFIG = {
   lineExtApi: { publisher: "saxon", group: "portal", version: "v1.0",
                 entities: { po: "purchaseLineExts", so: "salesLineExts", customers: "customerExts",
                             vendors: "vendorExts", vendorBanks: "vendorBankAccounts",   // vendor pages: v1.4
-                            poHeader: "purchaseOrderExts", soHeader: "salesOrderExts" } },   // Order Date + Document Date: v1.5
+                            poHeader: "purchaseOrderExts", soHeader: "salesOrderExts",   // Order Date + Document Date: v1.5
+                            poAttach: "orderAttachments" } },   // files on purchase orders (Deal orders tab): v1.6
 
   // Pending suppliers / customers tabs: read the SharePoint lists Trade Confirmation writes at approval.
   // Needs the delegated Graph permission Sites.ReadWrite.All on this app registration.
@@ -142,6 +143,17 @@ const CONFIG = {
     ccListId:    "3cbc6ddc-3db8-4379-beae-3480d44245f1",  // Carbon Credit Approval List (CC deals) – read only
     registerListName: "BC Counterparty Register",         // results for RECs / CC deals + auto-link memory
     registerListId:   "acafe2f9-dcbe-4864-a2c3-8a2c1a52ee0c"  // its ID (List settings URL); blank = find it by name
+  },
+
+  // "Deal orders" tab: approved Stock-In deal -> draft PO, Stock-Out deal -> draft SO (created by a button click)
+  dealOrders: {
+    // SharePoint list on the Operations site that remembers which deal became which BC order (setup checklist: see the tab)
+    listName: "BC Deal Orders", listId: "",
+    // folders (in the Operations site's document library) where Trade Confirmation stores each deal's files
+    agreementFolders: ["Agreement Files", "Trade Confirmation Files"],   // files are named "<Deal ID> - <file name>"
+    redemptionFolder: "Redemption Documents",                           // files are named "<Deal ID>_Product n_m"
+    driveId: "",                                                        // leave blank = the site's default document library
+    localCurrency: { MY: "MYR", SG: "SGD" }                             // order currency is only set when the deal currency differs
   },
 
   // Approvals need their own custom API page (only used if features.approvals = true).
@@ -479,9 +491,11 @@ const TABS = [
   { id: "inventory", label: "Inventory",   build: () => buildInventory() },
   { id: "po",        label: "Purchase Order", build: () => buildOrder("po") },
   { id: "so",        label: "Sales Order",    build: () => buildOrder("so") },
+  { id: "dealOrders", label: "Deal orders",   build: () => buildDealOrders() },
   { id: "approvals", label: "Approvals",   build: () => buildApprovals(), when: () => CONFIG.features.approvals }
 ].filter(t => !t.when || t.when());
-const refreshers = {};   // tab id -> function that reloads its list
+const refreshers = {};
+const orderCreators = {};   // "po" / "so" -> createDraftFromSpec(spec, hooks), registered by buildOrder, used by the Deal orders tab   // tab id -> function that reloads its list
 
 /* ---------- master data tab ---------- */
 /* next number from a BC number series (Saxon Portal API v1.2) */
@@ -2370,6 +2384,62 @@ function buildOrder(key) {
     } finally { saveBtn.disabled = false; }
   }
 
+  /* ---- used by the "Deal orders" tab: the same creation steps as Save, but from a ready-made spec ----
+     spec = { partyNo, orderDate, external, currencyCode, paymentTermCode, lines: [{ lineType, item, description, qty, cost, locationCode, vat }] }
+     hooks = { onProgress(text), onCreated(order) }.  On a failure after the header exists, the error carries .order and .done. */
+  async function createDraftFromSpec(spec, hooks = {}) {
+    const say = m => hooks.onProgress && hooks.onProgress(m);
+    const [parties, items, locations, extOk] = await Promise.all([
+      lookups[def.partyLookup](), lookups.items(), lookups.locations().catch(() => []), lineExtAvailable(key)]);
+    const hdrOk = await lineExtAvailable(key + "Header");
+    const partyRec = parties.find(r => (r.number || "").toLowerCase() === String(spec.partyNo || "").toLowerCase());
+    if (!partyRec) throw new Error(`${def.partyLabel} "${spec.partyNo}" not found in ${companyName()}.`);
+    if (typeof partyRec.blocked === "string" ? !/^(\s*|_x0020_)$/.test(partyRec.blocked) : partyRec.blocked) throw new Error(`${partyRec.number} is blocked in BC.`);
+    let dims = { plan: [], problems: [] };
+    try { dims = await resolveDims(DIMENSIONS); } catch (e) { dims.problems.push("Dimensions: " + e.message); }
+    const itemMap = new Map(items.map(i => [String(i.number).toLowerCase(), i]));
+    const bad = spec.lines.filter(l => l.lineType !== "Comment" && !itemMap.has(String(l.item || "").toLowerCase())).map(l => l.item || "(blank)");
+    if (bad.length) throw new Error("Part no. not found in BC: " + [...new Set(bad)].join(", "));
+    const lines = spec.lines.map(l => {
+      if (l.lineType === "Comment") return l;
+      const it = itemMap.get(l.item.toLowerCase());
+      let locationId = null;
+      if (l.locationCode) { const loc = locations.find(x => (x.code || "").toLowerCase() === l.locationCode.toLowerCase()); if (loc) locationId = loc.id; }
+      return { ...l, item: it.number, locationId };
+    });
+    const header = { [def.partyKey]: partyRec.number };
+    if (spec.orderDate) header.orderDate = spec.orderDate;
+    if (def.extKey && spec.external) header[def.extKey] = String(spec.external).slice(0, 35);
+    if (spec.currencyCode) header.currencyCode = spec.currencyCode;
+    if (spec.paymentTermCode) {
+      const t = (await paymentTermsLookup().catch(() => [])).find(x => String(x.code).toUpperCase() === spec.paymentTermCode.toUpperCase());
+      if (t) header.paymentTermsId = t.id;
+    }
+    const ctx = { warnings: [...dims.problems], vatSet: 0, vatPending: 0, extOk, dimPlan: dims.plan };
+    let order = null, done = 0;
+    try {
+      say("Creating draft " + def.title.replace(/s$/, "") + "...");
+      order = await co(`/${def.endpoint}`, { method: "POST", body: JSON.stringify(header) });
+      hooks.onCreated && await hooks.onCreated(order);
+      if (header.orderDate && hdrOk) {
+        try { await bcFetch(`${extBase(key + "Header")}(${order.id})`, { method: "PATCH", headers: { "If-Match": "*" }, body: JSON.stringify({ orderDate: header.orderDate, documentDate: header.orderDate }) }); }
+        catch (e) { ctx.warnings.push("Order Date / Document Date not both set – check them in BC: " + e.message); }
+      }
+      const hd = SETTINGS.headerDimensions || {};
+      if (Object.keys(hd).length) {
+        try { await co(`/${def.endpoint}(${order.id})`, { method: "PATCH", headers: { "If-Match": "*" }, body: JSON.stringify(hd) }); }
+        catch (e) { ctx.warnings.push("Header dimensions: " + e.message); }
+      }
+      for (const l of lines) {
+        say(`${order.number}: line ${done + 1} of ${lines.length}...`);
+        await createLine(order, l, ctx);
+        done++;
+      }
+      return { order, ctx, done };
+    } catch (e) { e.order = order; e.done = done; throw e; }
+  }
+  orderCreators[key] = createDraftFromSpec;
+
   /* ---- posting (switched off: CONFIG.features.posting) ---- */
   const qtyLines = o => (o[def.linesEndpoint] || []).filter(l => num(l.quantity) > 0);
   const toStep    = o => qtyLines(o).filter(l => num(l.quantity) > num(l[def.doneQtyKey]));
@@ -2470,6 +2540,505 @@ function buildOrder(key) {
 }
 
 
+/* =====================================================================
+   DEAL ORDERS tab
+   Approved RECs / Carbon Credit deals (the two read-only SharePoint lists) become draft BC orders
+   with ONE button click per deal:
+     Stock-In deal  -> draft Purchase Order   (supplier from the BC Counterparty Register)
+     Stock-Out deal -> draft Sales Order      (customer from the BC Counterparty Register)
+   The deal's own files (agreement, T&C, redemption documents) can be attached to the order.
+   Which deal became which order is remembered in the SharePoint list CONFIG.dealOrders.listName,
+   so a deal can never create two orders. The "Created orders" card lists those orders: users can upload more files
+   (saved in SharePoint, then attached to the same BC draft), retry files BC refused, and press "Notify Finance" with an
+   optional note. Finance sees the notice in the AP Request system (Deal Orders tab) and marks it handled there.
+   Nothing is posted and nothing is emailed from here: orders stay DRAFT, posting is done in BC.
+   ===================================================================== */
+const DO = () => CONFIG.dealOrders;
+/* columns of the "BC Deal Orders" list (display names). The first block is required, the rest is optional. */
+const DOCOL = { ref: "Title", source: "Source", entity: "Entity", type: "Order Type", no: "BC Order No.", orderId: "BC Order Id",
+  company: "BC Company", status: "Status", by: "Created By", date: "Created Date",
+  party: "Counterparty", files: "Files Attached", note: "Note", notified: "Finance Notified",
+  finBy: "Finance Notified By", finNote: "Finance Note", handledBy: "Finance Handled By", handledDate: "Finance Handled Date",
+  lastUpload: "Last Upload Date", pending: "Files Pending BC" };
+const DO_NEW_COLS = ["Finance Notified", "Finance Notified By", "Finance Note", "Finance Handled By", "Finance Handled Date", "Last Upload Date", "Files Pending BC"];
+const DO_REQUIRED = ["Source", "Entity", "Order Type", "BC Order No.", "BC Order Id", "BC Company", "Status", "Created By", "Created Date"];
+const DO_STATUS = { created: "Created", interrupted: "Interrupted" };
+const doListRef = () => DO().listId || { title: DO().listName };
+const doList = () => spList(doListRef(), DO_REQUIRED);
+const numOf = v => Number(String(v || "").replace(/,/g, "")) || 0;
+const safeFileKey = s => String(s).replace(/[\\\/:*?"<>|]/g, "-");
+
+/* ---------- reading the approved deals ---------- */
+/* the approved lists are append-only (one more row per product each time a deal changes): keep the newest row per Row Uid */
+function latestPerRow(items) {
+  const best = new Map(), loose = [];
+  for (const it of items) {
+    const u = fv(it, "Row Uid");
+    if (!u) { loose.push(it); continue; }
+    const b = best.get(u);
+    if (!b || Number(it.id) > Number(b.id)) best.set(u, it);
+  }
+  return [...best.values(), ...loose].sort((a, b) => Number(a.id) - Number(b.id));
+}
+function dealProduct(it) {
+  const yy = (fv(it, "V (From YY)") || fv(it, "Vintage Start Year")).replace(/\D/g, "").slice(-2);
+  return { itemId: it.id, registry: fv(it, "Registry"), tech: fv(it, "Tech") || fv(it, "Project Name"), vintage: yy,
+    qty: numOf(fv(it, "Volume (RECs)") || fv(it, "Volume (VCUs)")), price: fv(it, "Unit Price"), currency: fv(it, "Currency").toUpperCase(),
+    payTerm: fv(it, "Payment Term"), start: fv(it, "Delivery (Start date)"), end: fv(it, "Delivery (End date)") };
+}
+/* best guess of the BC part number for a deal product; "" when it is not clear-cut (the user then picks it) */
+function guessItem(p, items) {
+  const map = SETTINGS.dealItemMap || {};
+  const direct = map[[p.registry, p.tech, p.vintage].join("|")] || map[[p.registry, p.vintage].join("|")];
+  if (direct) return direct;
+  let c = items.filter(i => i.blocked !== true);
+  const reg = REGISTRIES.find(r => normName(r) === normName(p.registry));
+  if (reg) c = c.filter(i => registryFromText(i.displayName) === reg);
+  if (p.vintage) c = c.filter(i => vintageFrom(i) === p.vintage);
+  if (p.tech) { const t = normName(p.tech); const c2 = c.filter(i => normName(i.displayName).includes(t)); if (c2.length) c = c2; }
+  return c.length === 1 ? c[0].number : "";
+}
+/* the supplier / customer the deal's counterparty was linked to in the Pending suppliers / customers tabs */
+function partyFromRegister(g, reg) {
+  const regRole = ROLE_DEF[g.role].regRole, k = strictKey(g.company), here = normName(companyName());
+  const mine = reg.filter(r => fv(r, RCOL.role) === regRole && fv(r, RCOL.entity).toUpperCase() === g.entity &&
+    [QSTATUS.created, QSTATUS.linked].includes(fv(r, RCOL.status)) && fv(r, RCOL.no) &&
+    (!fv(r, RCOL.company) || normName(fv(r, RCOL.company)) === here));
+  return mine.find(r => fv(r, RCOL.ref) === g.ref && fv(r, RCOL.source) === g.sourceLabel) || mine.find(r => k && fv(r, RCOL.nameKey) === k) || null;
+}
+
+/* ---------- the deal's files in SharePoint ---------- */
+let doDrive = null;
+async function doDriveId() {
+  if (DO().driveId) return DO().driveId;
+  if (!doDrive) doDrive = (await graphFetch(`/sites/${await spSite()}/drive?$select=id`)).id;
+  return doDrive;
+}
+async function doFolder(driveId, folder) {
+  return cached("dofolder:" + driveId + "|" + folder, async () => {
+    const out = [];
+    let url = `/drives/${driveId}/root:/${folder.split("/").map(encodeURIComponent).join("/")}:/children?$select=id,name,size,webUrl,file&$top=999`;
+    try { while (url) { const d = await graphFetch(url); out.push(...d.value.filter(x => x.file)); url = d["@odata.nextLink"]; } }
+    catch (e) { if (e.status === 404) return []; throw e; }
+    return out;
+  });
+}
+async function dealFiles(ref) {
+  const driveId = await doDriveId(), key = safeFileKey(ref), out = [];
+  for (const f of DO().agreementFolders || [])
+    (await doFolder(driveId, f)).forEach(x => { if (x.name.startsWith(key + " - ")) out.push({ ...x, kind: "Agreement", driveId }); });
+  if (DO().redemptionFolder)
+    (await doFolder(driveId, DO().redemptionFolder)).forEach(x => { if (x.name.startsWith(key + "_")) out.push({ ...x, kind: "Redemption", driveId }); });
+  return out;
+}
+async function downloadDriveFile(f) {
+  const token = await getGraphToken();
+  const res = await fetch(`https://graph.microsoft.com/v1.0/drives/${f.driveId}/items/${f.id}/content`, { headers: { Authorization: "Bearer " + token } });
+  if (!res.ok) throw new Error(`SharePoint ${res.status} while downloading`);
+  return res.blob();
+}
+/* Put the files on the BC order. Sales orders use the standard documentAttachments API.
+   BC's standard API does not list "Purchase Order" as an attachment parent type, so POs use the Saxon Portal API v1.6 page
+   (orderAttachments). Without it we try the standard API once and, if BC refuses, write the file names as comment lines
+   on the PO instead (the files stay in SharePoint). */
+const blobToBase64 = blob => new Promise((resolve, reject) => {
+  const r = new FileReader();
+  r.onload = () => resolve(String(r.result).split(",")[1] || "");
+  r.onerror = () => reject(new Error("Could not read the file"));
+  r.readAsDataURL(blob);
+});
+async function attachFilesToOrder(key, order, files, say) {
+  const res = { attached: [], failed: [], poFallback: false };
+  const parentType = key === "po" ? "Purchase Order" : "Sales Order";
+  // purchase orders: the Saxon Portal API v1.6 page (orderAttachments) when installed, else the standard API is tried once
+  const useExt = key === "po" && await lineExtAvailable("poAttach");
+  let existing = new Set();
+  try {
+    existing = useExt
+      ? new Set((await bcFetch(`${extBase("poAttach")}?$filter=${encodeURIComponent(`orderNumber eq '${odq(order.number)}'`)}&$select=id,fileName`)).value.map(x => x.fileName))
+      : new Set((await co(`/documentAttachments?$filter=parentId eq ${order.id}&$select=id,fileName`)).value.map(x => x.fileName));
+  } catch { /* cannot list: attach anyway */ }
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    if (existing.has(f.name)) { res.attached.push(f.name); continue; }
+    say(`${order.number}: attaching file ${i + 1} of ${files.length} (${f.name})...`);
+    let att = null;
+    try {
+      const blob = await downloadDriveFile(f);
+      if (useExt) {
+        await bcFetch(extBase("poAttach"), { method: "POST", body: JSON.stringify({ orderNumber: order.number, fileName: f.name, contentBase64: await blobToBase64(blob) }) });
+        res.attached.push(f.name);
+        continue;
+      }
+      att = await co("/documentAttachments", { method: "POST", body: JSON.stringify({ parentId: order.id, fileName: f.name, parentType }) });
+      const token = await getToken();
+      const put = await fetch(`${BC_BASE}/companies(${companyId})/documentAttachments(${att.id})/attachmentContent`,
+        { method: "PATCH", headers: { Authorization: "Bearer " + token, "Content-Type": "application/octet-stream", "If-Match": "*" }, body: blob });
+      if (!put.ok) throw new Error(`BC ${put.status}: ${niceError(await put.text())}`);
+      res.attached.push(f.name);
+    } catch (e) {
+      if (att) { try { await co(`/documentAttachments(${att.id})`, { method: "DELETE", headers: { "If-Match": "*" } }); } catch { /* leave it */ } }
+      if (key === "po" && !useExt && !att && !res.attached.length) {   // the POST itself was refused -> no PO attachments without the v1.6 extension
+        res.poFallback = true;
+        res.failed.push(`BC does not accept attachments on purchase orders without Saxon Portal API v1.6 (${e.message})`);
+        break;
+      }
+      res.failed.push(`${f.name}: ${e.message}`);
+    }
+  }
+  if (res.poFallback) {
+    const def = ORDERS.po;
+    for (const f of files) {
+      try { await co(`/${def.endpoint}(${order.id})/${def.linesEndpoint}`, { method: "POST", body: JSON.stringify({ lineType: "Comment", description: ("FILE IN SHAREPOINT: " + f.name).slice(0, 100) }) }); }
+      catch { /* comment lines are a courtesy */ }
+    }
+  }
+  return res;
+}
+
+/* ---------- uploading extra files for an order ---------- */
+const DEAL_UPLOAD_MAX = 10 * 1024 * 1024;
+const DEAL_UPLOAD_EXT = ["pdf", "doc", "docx", "xls", "xlsx", "xlsm", "csv", "png", "jpg", "jpeg", "zip"];
+function checkDealFile(file) {
+  const ext = (file.name.split(".").pop() || "").toLowerCase();
+  if (!DEAL_UPLOAD_EXT.includes(ext)) return `${file.name}: .${ext} files are not allowed (PDF, Word, Excel, CSV, PNG, JPG or ZIP only).`;
+  if (!file.size) return `${file.name}: the file is empty.`;
+  if (file.size > DEAL_UPLOAD_MAX) return `${file.name}: larger than 10 MB.`;
+  return "";
+}
+/* the file goes to the first deal-files folder as "<Deal ID> - <name>" (same naming as Trade Confirmation, so every tool finds it) */
+async function uploadToDealFolder(ref, file) {
+  const driveId = await doDriveId(), folder = (DO().agreementFolders || [])[0] || "Agreement Files";
+  const base = `/drives/${driveId}/root:/${folder.split("/").map(encodeURIComponent).join("/")}/${encodeURIComponent(safeFileKey(ref + " - " + file.name))}:`;
+  let item;
+  if (file.size <= 4 * 1024 * 1024) {
+    const token = await getGraphToken();
+    const res = await fetch(`https://graph.microsoft.com/v1.0${base}/content?@microsoft.graph.conflictBehavior=rename`,
+      { method: "PUT", headers: { Authorization: "Bearer " + token, "Content-Type": file.type || "application/octet-stream" }, body: file });
+    if (!res.ok) throw new Error(`SharePoint ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    item = await res.json();
+  } else {
+    const session = await graphFetch(base + "/createUploadSession", { method: "POST", body: JSON.stringify({ item: { "@microsoft.graph.conflictBehavior": "rename" } }) });
+    const CHUNK = 5 * 1024 * 1024;   // a multiple of 320 KiB, as Graph requires
+    for (let start = 0; start < file.size; start += CHUNK) {
+      const end = Math.min(start + CHUNK, file.size);
+      const res = await fetch(session.uploadUrl, { method: "PUT", headers: { "Content-Range": `bytes ${start}-${end - 1}/${file.size}` }, body: file.slice(start, end) });
+      if (!res.ok) throw new Error(`SharePoint ${res.status} while uploading: ${(await res.text()).slice(0, 200)}`);
+      if (end === file.size) item = await res.json();
+    }
+    if (!item) throw new Error("SharePoint upload did not complete");
+  }
+  if (!item || !item.id || !item.name) throw new Error("SharePoint did not confirm the upload");
+  clearCache("dofolder:");
+  return { id: item.id, name: item.name, size: item.size, webUrl: item.webUrl, driveId, kind: "Uploaded" };
+}
+const splitNames = v => String(v || "").split(/;\s*/).map(x => x.trim()).filter(Boolean);
+const uniqNames = a => [...new Set(a)];
+
+/* ---------- the tab ---------- */
+function buildDealOrders() {
+  const pendingBox = h("div", { class: "tablewrap" }), createdBox = h("div", { class: "tablewrap" }), reviewBox = h("div", {});
+  const note = h("div", { class: "muted small", style: "margin:.25rem 0 .5rem" });
+  const filter = h("input", { type: "search", placeholder: "Search deal ID or company", style: "max-width:240px" });
+  let pickFor = null;
+  const picker = h("input", { type: "file", multiple: true, class: "hidden", accept: "." + DEAL_UPLOAD_EXT.join(",.") });
+  picker.addEventListener("change", () => { const l = pickFor, fl = [...picker.files]; picker.value = ""; if (l && fl.length) uploadFor(l, fl); });
+  let groups = [], links = [], linksCtx = null, register = [], loadNotes = [], openKey = null, busy = false;
+  filter.addEventListener("input", () => draw());
+
+  const linkKey = (ref, srcLabel, entity, type) => [ref, srcLabel, entity.toUpperCase(), type.toUpperCase()].join("|");
+  const linkOf = g => links.filter(l => linkKey(fv(l, DOCOL.ref), fv(l, DOCOL.source), fv(l, DOCOL.entity), fv(l, DOCOL.type)) === linkKey(g.ref, g.sourceLabel, g.entity, g.orderType))
+    .sort((a, b) => Number(b.id) - Number(a.id))[0] || null;
+
+  async function load() {
+    const since = queueSettings().since ? new Date(queueSettings().since) : null;
+    const notes = [], out = [];
+    clearCache("dofolder:");
+    linksCtx = null; links = [];
+    try {
+      linksCtx = await doList(); links = await spItems(linksCtx);
+      const miss = DO_NEW_COLS.filter(d => !linksCtx.col[d]);
+      if (miss.length) notes.push(`The list ${DO().listName} needs these extra columns (Single line of text) for uploads and Finance notices: ${miss.join(", ")}.`);
+    }
+    catch (e) { notes.push(`Deal order list: ${e.message} Create it on the Operations site with these Single-line-of-text columns: ${DO_REQUIRED.join(", ")} (optional: ${[DOCOL.party, DOCOL.files, DOCOL.note, DOCOL.notified].join(", ")}). The list title holds the Agreement ID. Orders cannot be created until it exists.`); }
+    try { register = await spItems(await regList()); } catch (e) { register = []; notes.push("Register: " + e.message); }
+    await Promise.all(["rec", "cc"].map(async s => {
+      const src = PARTY_SOURCES[s];
+      try {
+        const items = await spItems(await spList(src.list(), src.required));
+        const map = new Map();
+        for (const it of items) {
+          const role = roleFromSupplyDemand(fv(it, "Supply/Demand"));
+          if (!role) continue;
+          const ref = fv(it, src.refCol) || `(item ${it.id})`, entity = fv(it, "Entity").toUpperCase(), k = `${s}|${ref}|${entity}|${role}`;
+          if (!map.has(k)) map.set(k, { key: k, source: s, sourceLabel: src.label, role, ref, entity, orderType: role === "supplier" ? "po" : "so", items: [] });
+          map.get(k).items.push(it);
+        }
+        for (const g of map.values()) {
+          finishGroup(g, since);
+          g.company = fv(g.primary, "Company");
+          g.rows = latestPerRow(g.items);
+          g.products = g.rows.map(dealProduct);
+          out.push(g);
+        }
+      } catch (e) { notes.push(`${src.label}: ${e.message}`); }
+    }));
+    groups = out.sort((a, b) => (b.approvedTime || 0) - (a.approvedTime || 0));
+    loadNotes = notes;
+  }
+
+  async function refresh() {
+    pendingBox.replaceChildren(h("p", { class: "muted" }, "Loading approved deals..."));
+    createdBox.replaceChildren(h("p", { class: "muted" }, "Loading..."));
+    await load();
+    draw();
+    if (openKey) { const g = groups.find(x => x.key === openKey && !linkOf(x)); if (g) openReview(g); else { reviewBox.replaceChildren(); openKey = null; } }
+  }
+  refreshers.dealOrders = refresh;
+
+  function draw() {
+    const g0 = companyGroup(), q = filter.value.trim().toLowerCase();
+    const live = groups.filter(g => !g.beforeCutoff && g.entity === g0);
+    const todo = live.filter(g => !linkOf(g) || fv(linkOf(g), DOCOL.status) === DO_STATUS.interrupted)
+      .filter(g => !q || g.ref.toLowerCase().includes(q) || g.company.toLowerCase().includes(q));
+    note.replaceChildren(
+      h("div", {}, `Showing ${g0 || "?"} deals for ${companyName()}. Stock-In deals become draft Purchase Orders, Stock-Out deals draft Sales Orders.`),
+      ...loadNotes.map(n => h("div", {}, h("span", { class: "tag warn" }, "Check"), " ", n)));
+    if (!g0) { pendingBox.replaceChildren(h("p", { class: "muted" }, "This company is not matched to MY or SG in presets.js (companyGroups).")); createdBox.replaceChildren(); return; }
+    pendingBox.replaceChildren(!todo.length ? h("p", { class: "muted" }, "No approved deals waiting for an order.") : h("table", {},
+      h("thead", {}, h("tr", {}, ["Source", "Deal ID", "Counterparty", "Order", "Approved", "Volume", "Counterparty in BC", ""].map(x => h("th", {}, x)))),
+      h("tbody", {}, todo.map(g => {
+        const party = partyFromRegister(g, register), lk = linkOf(g), vol = g.products.reduce((s, p) => s + p.qty, 0);
+        return h("tr", {},
+          h("td", {}, h("span", { class: "tag" }, g.sourceLabel)), h("td", {}, g.ref), h("td", { class: "wrap" }, g.company),
+          h("td", {}, g.orderType === "po" ? "Purchase Order" : "Sales Order"), h("td", {}, fmtDate(g.approvedTime)),
+          h("td", { class: "num" }, fmtNum(vol)),
+          h("td", {}, party ? h("span", { class: "tag ok" }, fv(party, RCOL.no)) : h("span", { class: "tag warn" }, `Not in BC yet – use Pending ${g.role === "supplier" ? "suppliers" : "customers"}`)),
+          h("td", {}, lk ? h("span", { class: "tag warn" }, `Interrupted – ${fv(lk, DOCOL.no)} exists`)
+            : h("button", { type: "button", class: "small" + (openKey === g.key ? "" : " ghost"), disabled: !linksCtx || busy, onclick: () => openReview(g) }, "Review")));
+      }))));
+    const made = links.filter(l => normName(fv(l, DOCOL.company)) === normName(companyName()) && fv(l, DOCOL.status) === DO_STATUS.created)
+      .sort((a, b) => Number(b.id) - Number(a.id)).slice(0, 100);
+    const colsOk = !!linksCtx && DO_NEW_COLS.every(d => linksCtx.col[d]);
+    createdBox.replaceChildren(!made.length ? h("p", { class: "muted" }, "No orders created from deals yet.") : h("table", {},
+      h("thead", {}, h("tr", {}, ["Order", "Deal ID", "Counterparty", "Created", "Files in BC", "Waiting for BC", "Finance", ""].map(x => h("th", {}, x)))),
+      h("tbody", {}, made.map(l => {
+        const type = fv(l, DOCOL.type), no = fv(l, DOCOL.no), d = new Date(fv(l, DOCOL.date));
+        const inBc = splitNames(fv(l, DOCOL.files)), waiting = splitNames(fv(l, DOCOL.pending));
+        return h("tr", {},
+          h("td", {}, h("b", {}, no), " ", h("span", { class: "muted small" }, type)), h("td", {}, fv(l, DOCOL.ref)), h("td", { class: "wrap" }, fv(l, DOCOL.party)),
+          h("td", {}, isNaN(d) ? "" : fmtDate(d)),
+          h("td", { class: "wrap small", title: inBc.join("\n") }, inBc.length ? `${inBc.length} file(s)` : h("span", { class: "muted" }, "none")),
+          h("td", { class: "wrap small" }, waiting.length ? h("span", { class: "tag warn", title: waiting.join("\n") }, `${waiting.length} file(s)`) : ""),
+          h("td", { class: "wrap" }, financeCell(l)),
+          h("td", {}, h("span", { class: "row-actions", style: "margin:0;flex-wrap:wrap" },
+            h("button", { type: "button", class: "small", disabled: busy || !colsOk, onclick: () => { pickFor = l; picker.click(); } }, "Upload files"),
+            h("button", { type: "button", class: "small ghost", disabled: busy || !colsOk, onclick: () => syncFiles(l) }, waiting.length ? "Retry files" : "Sync files"),
+            h("button", { type: "button", class: "small" + (fv(l, DOCOL.notified) ? " ghost" : ""), disabled: busy || !colsOk, onclick: () => notifyFinance(l) }, "Notify Finance"))));
+      }))));
+  }
+
+  /* Finance column: not notified / notified (who, when, note) / picked up by Finance; a tag when files came after the notice */
+  function financeCell(l) {
+    const nd = fv(l, DOCOL.notified), by = fv(l, DOCOL.finBy), nt = fv(l, DOCOL.finNote), hb = fv(l, DOCOL.handledBy), hd = fv(l, DOCOL.handledDate), lu = fv(l, DOCOL.lastUpload);
+    if (!nd) return h("span", { class: "tag" }, "Not notified");
+    const out = [hb ? h("span", { class: "tag ok" }, `Picked up by ${hb} on ${hd.slice(0, 10)}`) : h("span", { class: "tag warn" }, `Notified ${nd.slice(0, 10)} by ${by || "?"}`)];
+    if (nt) out.push(h("div", { class: "small muted" }, nt));
+    if (lu && lu > nd) out.push(h("span", { class: "tag warn" }, "New files since notice"));
+    return h("div", {}, out);
+  }
+
+  /* the order must still be an open draft in BC (a fully invoiced order has moved to posted documents) */
+  async function openDraft(l) {
+    const type = fv(l, DOCOL.type).toLowerCase(), no = fv(l, DOCOL.no), def = ORDERS[type];
+    const hit = (await co(`/${def.endpoint}?$filter=${encodeURIComponent(`number eq '${odq(no)}'`)}&$select=id,number`)).value[0];
+    if (!hit) throw new Error(`${no} is no longer an open draft in BC (it may have been posted or deleted), so files cannot be added to it. Send the files to Finance directly.`);
+    return hit;
+  }
+  /* purchase orders need the Saxon Portal API v1.6 page to take attachments */
+  async function canAttach(type) { return type === "so" || await lineExtAvailable("poAttach"); }
+  const bcResult = (l, placedNames, r) => {
+    const inBc = uniqNames([...splitNames(fv(l, DOCOL.files)), ...r.attached]);
+    const pending = uniqNames([...splitNames(fv(l, DOCOL.pending)), ...placedNames]).filter(n => !inBc.includes(n));
+    return { inBc, pending };
+  };
+
+  /* Upload files: SharePoint first (one copy, easy to retry), then onto the same BC draft */
+  async function uploadFor(l, fileList) {
+    const files = [...fileList], errs = files.map(checkDealFile).filter(Boolean);
+    if (errs.length) { setStatus(errs.join(" "), "err"); return; }
+    const type = fv(l, DOCOL.type).toLowerCase(), no = fv(l, DOCOL.no), ref = fv(l, DOCOL.ref);
+    busy = true; draw();
+    try {
+      setStatus(`${no}: checking the order in BC...`);
+      const order = await openDraft(l);
+      const placed = [], failed = [];
+      for (let i = 0; i < files.length; i++) {
+        setStatus(`${no}: saving file ${i + 1} of ${files.length} to SharePoint (${files[i].name})...`);
+        try { placed.push(await uploadToDealFolder(ref, files[i])); } catch (e) { failed.push(`${files[i].name}: ${e.message}`); }
+      }
+      if (!placed.length) throw new Error("Nothing was uploaded. " + failed.join("; "));
+      let r = { attached: [], failed: [] }, note = "";
+      if (await canAttach(type)) r = await attachFilesToOrder(type, { id: order.id, number: no }, placed, setStatus);
+      else note = " Purchase orders need Saxon Portal API v1.6 in BC to take attachments, so the files are waiting in SharePoint.";
+      const { inBc, pending } = bcResult(l, placed.map(p => p.name), r);
+      await spWrite(linksCtx, l.id, { [DOCOL.files]: inBc.join("; ").slice(0, 250), [DOCOL.pending]: pending.join("; ").slice(0, 250), [DOCOL.lastUpload]: new Date().toISOString() }, null);
+      const problems = [...failed, ...r.failed];
+      setStatus(`${no}: ${r.attached.length} of ${files.length} file(s) are on the BC draft.` + note + (problems.length ? " Problems: " + problems.slice(0, 3).join("; ") : ""), problems.length || note ? "warn" : "ok");
+    } catch (e) { setStatus("Upload failed: " + e.message, "err"); }
+    finally { busy = false; refresh(); }
+  }
+
+  /* Retry / sync: put every deal file that is in SharePoint but not on the BC order yet (e.g. a refused file, or redemption docs that arrived later) */
+  async function syncFiles(l) {
+    const type = fv(l, DOCOL.type).toLowerCase(), no = fv(l, DOCOL.no), ref = fv(l, DOCOL.ref);
+    busy = true; draw();
+    try {
+      setStatus(`${no}: checking the order in BC...`);
+      const order = await openDraft(l);
+      if (!(await canAttach(type))) throw new Error("Purchase orders need Saxon Portal API v1.6 in BC to take attachments.");
+      setStatus(`Looking for ${ref} files in SharePoint...`);
+      const files = await dealFiles(ref);
+      if (!files.length) { setStatus(`No files found for deal ${ref} in SharePoint.`, "warn"); return; }
+      const r = await attachFilesToOrder(type, { id: order.id, number: no }, files, setStatus);
+      const inBc = uniqNames(r.attached), pending = files.map(f => f.name).filter(n => !inBc.includes(n));
+      await spWrite(linksCtx, l.id, { [DOCOL.files]: inBc.join("; ").slice(0, 250), [DOCOL.pending]: pending.join("; ").slice(0, 250) }, null);
+      setStatus(`${no}: ${inBc.length} file(s) on the BC draft.` + (r.failed.length ? " Problems: " + r.failed.slice(0, 3).join("; ") : ""), r.failed.length ? "warn" : "ok");
+    } catch (e) { setStatus("Could not sync files: " + e.message, "err"); }
+    finally { busy = false; refresh(); }
+  }
+
+  /* Notify Finance: a recorded notice (no email). A new notice clears an earlier "handled", so it returns to Finance's waiting list. */
+  async function notifyFinance(l) {
+    const no = fv(l, DOCOL.no);
+    const text = window.prompt(`Note for Finance about ${no} (optional), e.g. "SO posted in BC, please raise the invoice":`, "");
+    if (text === null) return;
+    busy = true; draw();
+    try {
+      await spWrite(linksCtx, l.id, { [DOCOL.notified]: new Date().toISOString(), [DOCOL.finBy]: account.username, [DOCOL.finNote]: text.trim().slice(0, 250), [DOCOL.handledBy]: "", [DOCOL.handledDate]: "" }, null);
+      setStatus(`Finance has been notified about ${no}. They will see it in the AP Request system.`, "ok");
+    } catch (e) { setStatus("Could not record the notice: " + e.message, "err"); }
+    finally { busy = false; refresh(); }
+  }
+
+  /* ---------- review + create ---------- */
+  async function openReview(g) {
+    openKey = g.key; draw();
+    reviewBox.replaceChildren(h("div", { class: "card" }, h("p", { class: "muted" }, "Preparing review...")));
+    try { reviewBox.replaceChildren(await buildDealReview(g)); reviewBox.scrollIntoView({ behavior: "smooth", block: "start" }); }
+    catch (e) { reviewBox.replaceChildren(h("div", { class: "card" }, h("p", {}, "Could not prepare the review: " + e.message))); }
+  }
+  async function buildDealReview(g) {
+    const key = g.orderType, def = ORDERS[key], isPO = key === "po", grp = companyGroup();
+    const VAT_LIST = (SETTINGS.vatGroups || {})[key] || ["LOCAL", "EXPORT"];
+    const items = await lookups.items();
+    const party = partyFromRegister(g, register);
+    const partyBox = searchBox({ placeholder: `Type ${def.partyLabel.toLowerCase()} no. or name`, source: lookups[def.partyLookup] });
+    if (party) partyBox.set(fv(party, RCOL.no));
+    const today = new Date().toISOString().slice(0, 10);
+    const date = h("input", { type: "date", value: today });
+    const vat = h("select", {}, h("option", { value: "" }, "(choose)"), VAT_LIST.map(v => h("option", { value: v }, v)));
+    const dealCur = g.products.map(p => p.currency).find(Boolean) || "";
+    const lcy = (DO().localCurrency || {})[grp] || "";
+    const cur = h("input", { value: dealCur && dealCur !== lcy ? dealCur : "", maxlength: "10", placeholder: "blank = local currency" });
+    const term = h("input", { value: matchPaymentTerm(g.products.map(p => p.payTerm).find(Boolean)), placeholder: "payment terms code" });
+    const termText = g.products.map(p => p.payTerm).find(Boolean) || "";
+    const rows = g.products.map(p => {
+      const item = searchBox({ placeholder: "Part no.", source: lookups.items, extra: r => r.baseUnitOfMeasureCode });
+      const guess = guessItem(p, items);
+      if (guess) item.set(guess);
+      return { p, item, qty: h("input", { type: "number", min: "0", step: "any", value: p.qty || "" }), price: h("input", { type: "number", min: "0", step: "any", value: p.price }),
+               loc: h("input", { value: locationFor(p.registry) || locationFor(REGISTRIES.find(r => normName(r) === normName(p.registry)) || ""), placeholder: "Location code" }) };
+    });
+    const poAttachOk = isPO ? await lineExtAvailable("poAttach") : true;
+    const filesBox = h("div", { class: "muted small" }, "Looking for the deal's files in SharePoint...");
+    const fileBoxes = [];
+    dealFiles(g.ref).then(files => {
+      if (!files.length) { filesBox.replaceChildren("No files found for this deal in SharePoint (agreement / T&C / redemption folders)."); return; }
+      filesBox.replaceChildren(...files.map(f => {
+        const cb = h("input", { type: "checkbox", checked: true }); fileBoxes.push({ cb, f });
+        return h("label", { class: "chk" }, cb, `${f.kind}: ${f.name} (${Math.max(1, Math.round(f.size / 1024))} KB)`);
+      }), isPO && !poAttachOk ? h("div", { class: "muted small", style: "margin-top:.3rem" }, h("span", { class: "tag warn" }, "Saxon Portal API v1.6 not found"), " BC cannot take attachments on purchase orders without it. The file names will be written as comment lines on the PO instead.") : "");
+    }).catch(e => filesBox.replaceChildren("Could not read the files from SharePoint: " + e.message));
+
+    const createBtn = h("button", { type: "button" }, `Create draft ${isPO ? "Purchase Order" : "Sales Order"}`);
+    createBtn.addEventListener("click", create);
+
+    async function create() {
+      const errs = [];
+      if (!partyBox.value) errs.push(`Choose the ${def.partyLabel.toLowerCase()}.`);
+      if (!vat.value) errs.push("Choose the VAT Bus. Posting Group.");
+      rows.forEach((r, i) => { if (!r.item.value) errs.push(`Line ${i + 1}: choose the part number.`); if (!(Number(r.qty.value) > 0)) errs.push(`Line ${i + 1}: quantity is needed.`); });
+      if (errs.length) { setStatus(errs.join(" "), "err"); return; }
+      busy = true; createBtn.disabled = true;
+      let row = null, order = null;
+      try {
+        setStatus("Checking that this deal has no order yet...");
+        const fresh = await spItems(await doList()); links = fresh;
+        const dup = linkOf(g);
+        if (dup) throw new Error(`Deal ${g.ref} already has ${fv(dup, DOCOL.type)} ${fv(dup, DOCOL.no)} (${fv(dup, DOCOL.status)}). Nothing was created.`);
+        const spec = { partyNo: partyBox.value, orderDate: date.value, external: g.ref, currencyCode: cur.value.trim().toUpperCase(), paymentTermCode: term.value.trim(),
+          lines: [...rows.map(r => ({ lineType: "Item", item: r.item.value, description: "", qty: r.qty.value, cost: r.price.value === "" ? "" : r.price.value, locationCode: r.loc.value.trim(), vat: vat.value })),
+                  { lineType: "Comment", description: `DEAL ${g.ref}`.slice(0, 100) }] };
+        const made = await orderCreators[key](spec, {
+          onProgress: setStatus,
+          onCreated: async o => {
+            order = o;
+            row = await spCreate(linksCtx, { [DOCOL.ref]: g.ref, [DOCOL.source]: g.sourceLabel, [DOCOL.entity]: g.entity, [DOCOL.type]: key.toUpperCase(),
+              [DOCOL.no]: o.number, [DOCOL.orderId]: o.id, [DOCOL.company]: companyName(), [DOCOL.status]: DO_STATUS.interrupted,
+              [DOCOL.by]: account.username, [DOCOL.date]: new Date().toISOString(), [DOCOL.party]: g.company, [DOCOL.note]: "Started – not finished yet" });
+          } });
+        order = made.order;
+        const notes = [...new Set(made.ctx.warnings)];
+        let attachedNames = [];
+        const chosen = fileBoxes.filter(x => x.cb.checked).map(x => x.f);
+        if (chosen.length) {
+          const r = await attachFilesToOrder(key, order, chosen, setStatus);
+          attachedNames = r.attached;
+          if (r.poFallback) notes.push("Files could not be attached to the PO – file names added as comment lines; files are in SharePoint.");
+          else if (r.failed.length) notes.push("Files not attached: " + r.failed.slice(0, 3).join("; "));
+        }
+        if (made.ctx.vatPending) notes.push(`VAT group to set in BC on ${made.ctx.vatPending} line(s).`);
+        await spWrite(linksCtx, row.id, { [DOCOL.status]: DO_STATUS.created, [DOCOL.files]: attachedNames.join("; ").slice(0, 250), [DOCOL.note]: notes.join(" ").slice(0, 250) }, null);
+        setStatus(`Saved draft ${order.number} for deal ${g.ref} with ${made.done} line(s)` + (attachedNames.length ? ` and ${attachedNames.length} file(s).` : ".") + (notes.length ? " Check: " + notes.slice(0, 3).join(" ") : ""), notes.length ? "warn" : "ok");
+        reviewBox.replaceChildren(); openKey = null;
+      } catch (e) {
+        const ord = e.order || order;
+        setStatus("Error: " + e.message + (ord ? ` (Draft ${ord.number} was created with ${e.done || 0} line(s); open it in Business Central to finish or delete it. The deal stays marked "Interrupted" until you delete its row in the ${DO().listName} list.)` : ""), "err");
+      } finally { busy = false; createBtn.disabled = false; refresh(); }
+    }
+
+    return h("div", { class: "card" },
+      h("div", { class: "card-head" }, h("h2", {}, `${g.sourceLabel} ${g.ref} – ${g.company}`),
+        h("button", { type: "button", class: "small ghost", onclick: () => { reviewBox.replaceChildren(); openKey = null; draw(); } }, "Close")),
+      h("p", { class: "muted small", style: "margin-top:-.4rem" }, `${g.typeLabel} · Entity ${g.entity} → ${companyName()} · approved ${g.approvedBy ? "by " + g.approvedBy + " " : ""}on ${fmtDate(g.approvedTime)} · Sales PIC ${fv(g.primary, "Title")}`),
+      party ? "" : h("p", { class: "small" }, h("span", { class: "tag warn" }, "No BC link"), ` This counterparty is not linked to a BC ${def.partyLabel.toLowerCase()} yet. Create or link it in the Pending ${isPO ? "suppliers" : "customers"} tab, or pick one here.`),
+      h("div", { class: "grid" },
+        h("label", {}, def.partyLabel + " (BC)", partyBox.el), h("label", {}, "Order / document date", date),
+        h("label", {}, "VAT Bus. Posting Group", vat), h("label", {}, "Order currency", cur),
+        h("label", {}, "Payment terms" + (termText ? ` (deal: ${termText})` : ""), term)),
+      h("h3", { style: "margin:1rem 0 .4rem;font-size:.9rem" }, "Lines (from the approved deal – change anything that is wrong)"),
+      h("div", { class: "tablewrap" }, h("table", {},
+        h("thead", {}, h("tr", {}, ["Deal product", "Part no.", "Quantity", def.priceLabel, "Location"].map(x => h("th", {}, x)))),
+        h("tbody", {}, rows.map(r => h("tr", {},
+          h("td", { class: "wrap small" }, [r.p.registry, r.p.tech, r.p.vintage ? "V" + r.p.vintage : "", r.p.start ? `${r.p.start}${r.p.end ? " – " + r.p.end : ""}` : ""].filter(Boolean).join(" · ")),
+          h("td", {}, r.item.el), h("td", {}, r.qty), h("td", {}, r.price), h("td", {}, r.loc)))))),
+      h("h3", { style: "margin:1rem 0 .4rem;font-size:.9rem" }, "Deal files to attach to the order"),
+      filesBox,
+      h("div", { class: "row-actions", style: "border-top:1px solid var(--line);padding-top:.75rem" },
+        createBtn, h("span", { class: "muted small" }, "Creates a DRAFT only. It is not received, shipped or posted.")));
+  }
+
+  return h("div", {},
+    h("div", { class: "card" },
+      h("div", { class: "card-head" }, h("h2", {}, "Approved deals → draft orders"),
+        h("div", { class: "row-actions", style: "margin:0" }, filter, h("button", { type: "button", class: "ghost", onclick: refresh }, "Refresh"))),
+      note, pendingBox),
+    reviewBox,
+    h("div", { class: "card" }, h("h2", {}, "Created orders"), h("p", { class: "muted small", style: "margin:-.4rem 0 .5rem" }, "Draft orders created from deals. Upload more files for an order (up to 10 MB each: PDF, Word, Excel, CSV, PNG, JPG, ZIP), then press Notify Finance when it is ready for their next step."), createdBox, picker));
+}
+
+
 /* ---------- approvals tab (switched off: CONFIG.features.approvals) ---------- */
 function approvalBase() {
   const a = CONFIG.approvalApi;
@@ -2531,7 +3100,7 @@ function showTab(id) {
   if (!TABS.some(t => t.id === id)) id = TABS[0].id;
   document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === id));
   document.querySelectorAll("#panels > div").forEach(p => p.classList.toggle("hidden", p.dataset.tab !== id));
-  if ((!loaded[id] || id === "inventory" || id === "approvals" || id === "supplierQueue" || id === "customerQueue") && refreshers[id]) { loaded[id] = true; refreshers[id](); }
+  if ((!loaded[id] || id === "inventory" || id === "approvals" || id === "supplierQueue" || id === "customerQueue" || id === "dealOrders") && refreshers[id]) { loaded[id] = true; refreshers[id](); }
 }
 function buildUI(activeId) {
   Object.keys(loaded).forEach(k => delete loaded[k]);
