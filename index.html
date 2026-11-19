@@ -85,6 +85,9 @@
   input.upper { text-transform:uppercase; }
   .fx-item { margin-top:.6rem; padding:.5rem .6rem; background:#f7f9fb; border:1px dashed var(--line); border-radius:6px; }
   input:disabled { background:#eef1f4; color:var(--muted); }
+  #lockbar { margin:0 1rem .75rem; padding:.6rem .8rem; border-radius:6px; background:#fdecea; color:#8a1c12; border:1px solid #f3b8b2; display:flex; gap:.75rem; align-items:center; flex-wrap:wrap; }
+  #lockbar b { white-space:nowrap; }
+  #lockbar .grow { flex:1; min-width:200px; }
 </style>
 </head>
 <body>
@@ -97,6 +100,7 @@
 </header>
 
 <div id="status">Not signed in.</div>
+<div id="lockbar" class="hidden" role="alert"></div>
 
 <main id="app" class="hidden">
   <nav id="tabs"></nav>
@@ -161,6 +165,11 @@ const CONFIG = {
     publisher: "", group: "portal", version: "v1.0", entity: "approvalEntries",
     approveAction: "approve", rejectAction: "reject"
   },
+  // Posting lock: one global switch kept in a SharePoint list on the Operations site.
+  // List needs a "Locked" column (Yes/No) and, optionally, a "Reason" column (single line text); one row titled "Posting".
+  // While Locked = Yes, nobody can post (receive / ship) from this portal; drafts can still be saved.
+  // failClosed: if the list cannot be read (missing, no permission, network), posting stays blocked.
+  postingLock: { enabled: true, listName: "BC Posting Lock", listId: "", failClosed: true, recheckSeconds: 60 },
   lowStockThreshold: 10         // inventory at or below this is highlighted
 };
 /* ======================================== */
@@ -810,9 +819,10 @@ async function spList(ref, required = []) {
     if (!hit) throw new Error(`The SharePoint list "${ref.title}" does not exist on the Operations site yet – create it (see the setup checklist).`);
     listId = hit.id; label = ref.title;
   }
-  const cols = await graphFetch(`/sites/${siteId}/lists/${listId}/columns?$select=name,displayName`);
+  const cols = await graphFetch(`/sites/${siteId}/lists/${listId}/columns?$select=name,displayName,readOnly`);
   const col = { Title: "Title" };
-  cols.value.forEach(c => { col[c.displayName] = c.name; });
+  // SharePoint also lists read-only helper columns (LinkTitle, LinkTitleNoMenu) whose display name is "Title" – never write to those
+  cols.value.forEach(c => { if (c.readOnly || /^LinkTitle/i.test(c.name)) return; col[c.displayName] = c.name; });
   const missing = required.filter(d => !col[d]);
   if (missing.length) throw new Error(`The list "${label}" is missing these columns: ${missing.join(", ")}. Add them in SharePoint (see the setup checklist), then click Refresh.`);
   return (spCtxs[k] = { siteId, listId, col, label });
@@ -849,6 +859,71 @@ function fv(item, displayName) {
   const name = item && item.ctx && item.ctx.col[displayName];
   const v = name ? item.f[name] : undefined;
   return v == null ? "" : String(v).trim();
+}
+
+/* ---------- posting lock (SharePoint list "BC Posting Lock", CONFIG.postingLock) ----------
+   Hard stop lives in assertPostingOpen(), which postReceiveShip / postStep call and which is
+   re-read from SharePoint on every post attempt (no cache), so flipping the switch takes effect at once.
+   The banner and disabled buttons are only the visible part; they refresh every recheckSeconds. */
+const postingLock = { locked: false, reason: "", error: "", checkedAt: 0 };
+let lockBtns = [];
+const lockBar = document.getElementById("lockbar");
+
+function lockMessage() {
+  if (postingLock.error) return `Posting is blocked: the posting lock could not be read (${postingLock.error}).`;
+  return "Posting is locked" + (postingLock.reason ? ": " + postingLock.reason : ".") + " Drafts can still be saved.";
+}
+async function readPostingLock() {
+  const c = CONFIG.postingLock;
+  if (!c || !c.enabled) return { locked: false, reason: "", error: "" };
+  try {
+    const ctx = await spList(c.listId || { title: c.listName }, ["Locked"]);
+    const items = await spItems(ctx);
+    const it = items.find(i => fv(i, "Title").toLowerCase() === "posting") || items[0];
+    if (!it) throw new Error(`the list "${ctx.label}" has no row – add one row titled Posting`);
+    const v = fv(it, "Locked").toLowerCase();
+    // only an explicit "no / false" opens posting; empty or anything unexpected stays locked
+    const open = ["no", "false", "0", "unlocked", "open"].includes(v);
+    return { locked: !open, reason: open ? "" : (fv(it, "Reason") || ""), error: "" };
+  } catch (e) {
+    if (c.failClosed === false) return { locked: false, reason: "", error: "" };
+    return { locked: true, reason: "", error: String(e.message || e).replace(/^SharePoint \d+: /, "").slice(0, 160) };
+  }
+}
+function applyLock() {
+  const blocked = postingLock.locked;
+  lockBtns = lockBtns.filter(b => b.isConnected || !b._seen);
+  lockBtns.forEach(b => {
+    b._seen = b.isConnected;
+    b.disabled = blocked || !!b._base;
+    if (blocked) b.title = lockMessage(); else b.title = b._baseTitle || "";
+  });
+  if (!blocked) { lockBar.classList.add("hidden"); lockBar.replaceChildren(); return; }
+  lockBar.replaceChildren(
+    h("b", {}, postingLock.error ? "Posting blocked" : "Posting locked"),
+    h("span", { class: "grow" }, postingLock.error ? lockMessage() : (postingLock.reason || "An administrator has locked posting. Drafts can still be saved.")),
+    h("button", { type: "button", class: "ghost small", onclick: () => refreshPostingLock(true) }, "Re-check"));
+  lockBar.classList.remove("hidden");
+}
+async function refreshPostingLock(announce) {
+  Object.assign(postingLock, await readPostingLock(), { checkedAt: Date.now() });
+  applyLock();
+  if (announce) setStatus(postingLock.locked ? lockMessage() : "Posting is open.", postingLock.locked ? "warn" : "ok");
+  return postingLock;
+}
+/* call right before any post; throws when locked. Always reads the list fresh. */
+async function assertPostingOpen() {
+  await refreshPostingLock();
+  if (postingLock.locked) { const e = new Error(lockMessage()); e.lockBlocked = true; throw e; }
+}
+/* register a post button so it is disabled while locked; base = its own normal disabled state */
+function lockGate(btn, base, baseTitle) {
+  btn._base = !!base; btn._baseTitle = baseTitle || ""; lockBtns.push(btn); applyLock(); return btn;
+}
+/* used by the click handlers: returns true (and shows the reason) when posting must not go ahead */
+async function postingBlocked() {
+  try { await assertPostingOpen(); return false; }
+  catch (e) { setStatus(e.message, "warn"); return true; }
 }
 
 /* ---------- prefill helpers ---------- */
@@ -2341,9 +2416,10 @@ function buildOrder(key) {
   }
 
   const saveBtn = h("button", { type: "button", onclick: () => save(false) }, "Save draft");
-  const savePostBtn = h("button", { type: "button", class: "ghost", onclick: () => save(true) }, `Save and post (${def.stepVerb})`);
+  const savePostBtn = lockGate(h("button", { type: "button", class: "ghost", onclick: () => save(true) }, `Save and post (${def.stepVerb})`));
   async function save(doPost) {
     if (!plan) return;
+    if (doPost && await postingBlocked()) return;   // posting lock
     if (doPost && !confirm(`Save the draft and then ${def.stepVerb} it (post) in Business Central?\n\nPosting ${def.stepVerb}s the stock and cannot be undone from this portal. Invoicing stays a separate step for Finance.`)) return;
     saveBtn.disabled = savePostBtn.disabled = true;
     const ctx = { warnings: [...plan.dimProblems], vatSet: 0, vatPending: 0, extOk: plan.extOk, dimPlan: plan.dimPlan };
@@ -2387,7 +2463,7 @@ function buildOrder(key) {
       const extra = order ? ` (Draft ${order.number} was created with ${done} of ${lines.length} lines; open it in Business Central to fix or delete it.)` : "";
       setStatus("Error: " + e.message + extra, "err");
       if (order) { plan = null; backToEdit(); refresh(); }
-    } finally { saveBtn.disabled = savePostBtn.disabled = false; }
+    } finally { saveBtn.disabled = false; applyLock(); }
   }
 
   /* ---- used by the "Deal orders" tab: the same creation steps as Save, but from a ready-made spec ----
@@ -2448,6 +2524,7 @@ function buildOrder(key) {
      Sets the quantity to receive / ship on every open line, quantity to invoice 0, then runs BC's post action.
      Returns { posted: n } or { nothing: true } when everything was already received / shipped. Posting cannot be undone from here. */
   async function postReceiveShip(order, say) {
+    await assertPostingOpen();   // posting lock
     say && say(`${order.number}: reading the lines...`);
     const o = await co(`/${def.endpoint}(${order.id})?$expand=${def.linesEndpoint}`);
     const lines = (o[def.linesEndpoint] || []).filter(l => l.lineType === "Item" && num(l.quantity) > 0);
@@ -2473,6 +2550,7 @@ function buildOrder(key) {
   async function postStep(order, mode, button) {
     const isInv = mode === "invoice";
     const stepName = isInv ? "Invoice" : def.stepLabel;
+    if (await postingBlocked()) return;   // posting lock
     if (!confirm(isInv ? `Post the invoice for ${order.number}? This cannot be undone from this portal.` : `${def.stepLabel} ${order.number}?`)) return;
     button.disabled = true; setStatus(`${stepName}: preparing ${order.number}...`);
     try {
@@ -2863,7 +2941,7 @@ function buildDealOrders() {
           h("td", { class: "wrap small" }, fv(l, DOCOL.postedDate) ? h("span", { class: "tag ok" }, `Posted ${fv(l, DOCOL.postedDate).slice(0, 10)} by ${fv(l, DOCOL.postedBy)}`) : h("span", { class: "tag" }, "Draft")),
           h("td", { class: "wrap" }, financeCell(l)),
           h("td", {}, h("span", { class: "row-actions", style: "margin:0;flex-wrap:wrap" },
-            fv(l, DOCOL.postedDate) ? "" : h("button", { type: "button", class: "small", disabled: busy || !postColsOk, title: postColsOk ? "" : "Add the Posted By / Posted Date columns first", onclick: () => postRow(l) }, `Post (${ORDERS[type.toLowerCase()].stepVerb})`),
+            fv(l, DOCOL.postedDate) ? "" : h("button", { type: "button", class: "small", disabled: busy || !postColsOk || postingLock.locked, title: postingLock.locked ? lockMessage() : postColsOk ? "" : "Add the Posted By / Posted Date columns first", onclick: () => postRow(l) }, `Post (${ORDERS[type.toLowerCase()].stepVerb})`),
             h("button", { type: "button", class: "small", disabled: busy || !colsOk, onclick: () => { pickFor = l; picker.click(); } }, "Upload files"),
             h("button", { type: "button", class: "small ghost", disabled: busy || !colsOk, onclick: () => syncFiles(l) }, waiting.length ? "Retry files" : "Sync files"),
             h("button", { type: "button", class: "small" + (fv(l, DOCOL.notified) ? " ghost" : ""), disabled: busy || !colsOk, onclick: () => notifyFinance(l) }, "Notify Finance"))));
@@ -2943,6 +3021,7 @@ function buildDealOrders() {
   /* Post (receive / ship) a draft that is already in BC. Invoicing stays Finance's step. */
   async function postRow(l) {
     const type = fv(l, DOCOL.type).toLowerCase(), no = fv(l, DOCOL.no), def = ORDERS[type];
+    if (await postingBlocked()) return;   // posting lock
     if (!confirm(`${def.stepLabel} ${no} in Business Central (post)?\n\nThis ${def.stepVerb}s the stock and cannot be undone from this portal. Invoicing stays a separate step for Finance.`)) return;
     busy = true; draw();
     try {
@@ -3012,7 +3091,7 @@ function buildDealOrders() {
 
     const postOk = DO_POST_COLS.every(d => linksCtx && linksCtx.col[d]);
     const createBtn = h("button", { type: "button" }, `Save draft ${isPO ? "Purchase Order" : "Sales Order"}`);
-    const createPostBtn = h("button", { type: "button", class: "ghost", disabled: !postOk, title: postOk ? "" : `Add the columns ${DO_POST_COLS.join(" and ")} to the ${DO().listName} list first` }, `Save and post (${def.stepVerb})`);
+    const createPostBtn = lockGate(h("button", { type: "button", class: "ghost" }, `Save and post (${def.stepVerb})`), !postOk, postOk ? "" : `Add the columns ${DO_POST_COLS.join(" and ")} to the ${DO().listName} list first`);
     createBtn.addEventListener("click", () => create(false));
     createPostBtn.addEventListener("click", () => create(true));
 
@@ -3022,6 +3101,7 @@ function buildDealOrders() {
       if (!vat.value) errs.push("Choose the VAT Bus. Posting Group.");
       rows.forEach((r, i) => { if (!r.item.value) errs.push(`Line ${i + 1}: choose the part number.`); if (!(Number(r.qty.value) > 0)) errs.push(`Line ${i + 1}: quantity is needed.`); });
       if (errs.length) { setStatus(errs.join(" "), "err"); return; }
+      if (doPost && await postingBlocked()) return;   // posting lock
       if (doPost && !confirm(`Save the draft ${isPO ? "PO" : "SO"} for deal ${g.ref} and then ${def.stepVerb} it (post) in Business Central?\n\nPosting ${def.stepVerb}s the stock and cannot be undone from this portal. Invoicing stays a separate step for Finance.`)) return;
       busy = true; createBtn.disabled = createPostBtn.disabled = true;
       let row = null, order = null;
@@ -3063,7 +3143,7 @@ function buildDealOrders() {
       } catch (e) {
         const ord = e.order || order;
         setStatus("Error: " + e.message + (ord ? ` (Draft ${ord.number} was created with ${e.done || 0} line(s); open it in Business Central to finish or delete it. The deal stays marked "Interrupted" until you delete its row in the ${DO().listName} list.)` : ""), "err");
-      } finally { busy = false; createBtn.disabled = createPostBtn.disabled = false; refresh(); }
+      } finally { busy = false; createBtn.disabled = false; createPostBtn.disabled = false; applyLock(); refresh(); }
     }
 
     return h("div", { class: "card" },
@@ -3199,6 +3279,8 @@ async function onSignedIn() {
     document.getElementById("app").classList.remove("hidden");
     buildUI();
     prefetch();
+    refreshPostingLock();
+    if (CONFIG.postingLock && CONFIG.postingLock.enabled) setInterval(refreshPostingLock, Math.max(15, CONFIG.postingLock.recheckSeconds || 60) * 1000);
     setStatus("Signed in as " + account.username, "ok");
   } catch (e) { setStatus("Error: " + e.message, "err"); }
 }
