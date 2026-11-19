@@ -822,10 +822,12 @@ async function spList(ref, required = []) {
   const cols = await graphFetch(`/sites/${siteId}/lists/${listId}/columns?$select=name,displayName,readOnly`);
   const col = { Title: "Title" };
   // SharePoint also lists read-only helper columns (LinkTitle, LinkTitleNoMenu) whose display name is "Title" – never write to those
-  cols.value.forEach(c => { if (c.readOnly || /^LinkTitle/i.test(c.name)) return; col[c.displayName] = c.name; });
+  // (system columns such as Created By are read-only but must still count as "present" for the column check; they are just never written)
+  const ro = new Set();
+  cols.value.forEach(c => { if (/^LinkTitle/i.test(c.name)) return; col[c.displayName] = c.name; if (c.readOnly) ro.add(c.name); });
   const missing = required.filter(d => !col[d]);
   if (missing.length) throw new Error(`The list "${label}" is missing these columns: ${missing.join(", ")}. Add them in SharePoint (see the setup checklist), then click Refresh.`);
-  return (spCtxs[k] = { siteId, listId, col, label });
+  return (spCtxs[k] = { siteId, listId, col, ro, label });
 }
 const regRef = () => CONFIG.graph.registerListId || { title: CONFIG.graph.registerListName || "BC Counterparty Register" };
 const regList = () => spList(regRef(), Object.values(RCOL).filter(c => c !== "Title"));
@@ -844,7 +846,7 @@ async function spItems(ctx) {
 async function spGet(ctx, id) { return wrapItem(ctx, await graphFetch(itemUrl(ctx, id) + "?$expand=fields")); }
 function spFields(ctx, byDisplayName) {
   const body = {};
-  for (const [d, v] of Object.entries(byDisplayName)) if (ctx.col[d]) body[ctx.col[d]] = v;
+  for (const [d, v] of Object.entries(byDisplayName)) if (ctx.col[d] && !(ctx.ro && ctx.ro.has(ctx.col[d]))) body[ctx.col[d]] = v;
   return body;
 }
 /* write { displayName: value }; If-Match makes it fail with 412 when someone changed it first */
@@ -2660,13 +2662,13 @@ function buildOrder(key) {
 const DO = () => CONFIG.dealOrders;
 /* columns of the "BC Deal Orders" list (display names). The first block is required, the rest is optional. */
 const DOCOL = { ref: "Title", source: "Source", entity: "Entity", type: "Order Type", no: "BC Order No.", orderId: "BC Order Id",
-  company: "BC Company", status: "Status", by: "Created By", date: "Created Date",
+  company: "BC Company", status: "Status", by: "Portal User", date: "Created Date",
   party: "Counterparty", files: "Files Attached", note: "Note", notified: "Finance Notified",
   finBy: "Finance Notified By", finNote: "Finance Note", handledBy: "Finance Handled By", handledDate: "Finance Handled Date",
   lastUpload: "Last Upload Date", pending: "Files Pending BC", postedBy: "Posted By", postedDate: "Posted Date" };
 const DO_POST_COLS = ["Posted By", "Posted Date"];
 const DO_NEW_COLS = ["Finance Notified", "Finance Notified By", "Finance Note", "Finance Handled By", "Finance Handled Date", "Last Upload Date", "Files Pending BC"];
-const DO_REQUIRED = ["Source", "Entity", "Order Type", "BC Order No.", "BC Order Id", "BC Company", "Status", "Created By", "Created Date"];
+const DO_REQUIRED = ["Source", "Entity", "Order Type", "BC Order No.", "BC Order Id", "BC Company", "Status", "Portal User", "Created Date"];
 const DO_STATUS = { created: "Created", interrupted: "Interrupted" };
 const doListRef = () => DO().listId || { title: DO().listName };
 const doList = () => spList(doListRef(), DO_REQUIRED);
