@@ -3083,6 +3083,21 @@ function buildDealOrders() {
     const poAttachOk = isPO ? await lineExtAvailable("poAttach") : true;
     const filesBox = h("div", { class: "muted small" }, "Looking for the deal's files in SharePoint...");
     const fileBoxes = [];
+    /* files added from this computer: uploaded to the deal's SharePoint folder, then attached to the BC order when it is created */
+    const localFiles = [];
+    const localList = h("div", { class: "small", style: "margin-top:.4rem" });
+    const localPicker = h("input", { type: "file", multiple: true, class: "hidden", accept: "." + DEAL_UPLOAD_EXT.join(",.") });
+    const drawLocal = () => localList.replaceChildren(...localFiles.map((f, i) => h("div", {},
+      `${f.name} (${Math.max(1, Math.round(f.size / 1024))} KB) `,
+      h("button", { type: "button", class: "ghost small", disabled: busy, onclick: () => { localFiles.splice(i, 1); drawLocal(); } }, "Remove"))));
+    localPicker.addEventListener("change", () => {
+      const fl = [...localPicker.files]; localPicker.value = "";
+      const errs = fl.map(checkDealFile).filter(Boolean);
+      if (errs.length) { setStatus(errs.join(" "), "err"); return; }
+      fl.forEach(f => { if (!localFiles.some(x => x.name === f.name && x.size === f.size)) localFiles.push(f); });
+      drawLocal();
+    });
+    const addLocalBtn = h("button", { type: "button", class: "ghost small", onclick: () => localPicker.click() }, "Add files from my computer");
     dealFiles(g.ref).then(files => {
       if (!files.length) { filesBox.replaceChildren("No files found for this deal in SharePoint (agreement / T&C / redemption folders)."); return; }
       filesBox.replaceChildren(...files.map(f => {
@@ -3127,6 +3142,12 @@ function buildDealOrders() {
         const notes = [...new Set(made.ctx.warnings)];
         let attachedNames = [];
         const chosen = fileBoxes.filter(x => x.cb.checked).map(x => x.f);
+        const localFailed = [];
+        for (let i = 0; i < localFiles.length; i++) {
+          setStatus(`${order.number}: saving file ${i + 1} of ${localFiles.length} to SharePoint (${localFiles[i].name})...`);
+          try { chosen.push(await uploadToDealFolder(g.ref, localFiles[i])); } catch (e) { localFailed.push(`${localFiles[i].name}: ${e.message}`); }
+        }
+        if (localFailed.length) notes.push("Not uploaded: " + localFailed.slice(0, 3).join("; "));
         if (chosen.length) {
           const r = await attachFilesToOrder(key, order, chosen, setStatus);
           attachedNames = r.attached;
@@ -3165,6 +3186,7 @@ function buildDealOrders() {
           h("td", {}, r.item.el), h("td", {}, r.qty), h("td", {}, r.price), h("td", {}, r.loc)))))),
       h("h3", { style: "margin:1rem 0 .4rem;font-size:.9rem" }, "Deal files to attach to the order"),
       filesBox,
+      h("div", { style: "margin-top:.6rem" }, addLocalBtn, h("span", { class: "muted small" }, " Up to 10 MB each: PDF, Word, Excel, CSV, PNG, JPG, ZIP. Saved in the deal's SharePoint folder and attached to the order."), localPicker, localList),
       h("div", { class: "row-actions", style: "border-top:1px solid var(--line);padding-top:.75rem" },
         createBtn, createPostBtn, h("span", { class: "muted small" }, `Save draft: nothing is ${def.stepPast} or posted. Save and post: ${def.stepVerb}s it in BC (no invoice – that is Finance's step).`)));
   }
