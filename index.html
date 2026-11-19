@@ -154,7 +154,8 @@ const CONFIG = {
     // SharePoint list on the Operations site that remembers which deal became which BC order (setup checklist: see the tab)
     listName: "BC Deal Orders", listId: "",
     // folders (in the Operations site's document library) where Trade Confirmation stores each deal's files
-    agreementFolders: ["Agreement Files", "Trade Confirmation Files"],   // files are named "<Deal ID> - <file name>"
+    agreementFolders: ["Agreement Files", "Trade Confirmation Files", "Agreement Files Additions"],   // files are named "<Deal ID> - <file name>"
+    uploadFolder: "Agreement Files Additions",   // files uploaded from the portal go here (a folder in the library below; created if missing)
     redemptionFolder: "Redemption Documents",                           // files are named "<Deal ID>_Product n_m"
     driveId: "",                                                        // leave blank = the site's default document library
     localCurrency: { MY: "MYR", SG: "SGD" }                             // order currency is only set when the deal currency differs
@@ -2815,7 +2816,7 @@ function checkDealFile(file) {
 }
 /* the file goes to the first deal-files folder as "<Deal ID> - <name>" (same naming as Trade Confirmation, so every tool finds it) */
 async function uploadToDealFolder(ref, file) {
-  const driveId = await doDriveId(), folder = (DO().agreementFolders || [])[0] || "Agreement Files";
+  const driveId = await doDriveId(), folder = DO().uploadFolder || (DO().agreementFolders || [])[0] || "Agreement Files";
   const base = `/drives/${driveId}/root:/${folder.split("/").map(encodeURIComponent).join("/")}/${encodeURIComponent(safeFileKey(ref + " - " + file.name))}:`;
   let item;
   if (file.size <= 4 * 1024 * 1024) {
