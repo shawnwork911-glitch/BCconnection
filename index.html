@@ -2666,7 +2666,8 @@ const DOCOL = { ref: "Title", source: "Source", entity: "Entity", type: "Order T
   company: "BC Company", status: "Status", by: "Portal User", date: "Created Date",
   party: "Counterparty", files: "Files Attached", note: "Note", notified: "Finance Notified",
   finBy: "Finance Notified By", finNote: "Finance Note", handledBy: "Finance Handled By", handledDate: "Finance Handled Date",
-  lastUpload: "Last Upload Date", pending: "Files Pending BC", postedBy: "Posted By", postedDate: "Posted Date" };
+  lastUpload: "Last Upload Date", pending: "Files Pending BC", postedBy: "Posted By", postedDate: "Posted Date",
+  links: "Files Links" };   // optional "Multiple lines of text" (plain text) column: one "file name | SharePoint link" line per file
 const DO_POST_COLS = ["Posted By", "Posted Date"];
 const DO_NEW_COLS = ["Finance Notified", "Finance Notified By", "Finance Note", "Finance Handled By", "Finance Handled Date", "Last Upload Date", "Files Pending BC"];
 const DO_REQUIRED = ["Source", "Entity", "Order Type", "BC Order No.", "BC Order Id", "BC Company", "Status", "Portal User", "Created Date"];
@@ -2730,6 +2731,17 @@ async function doFolder(driveId, folder) {
     catch (e) { if (e.status === 404) return []; throw e; }
     return out;
   });
+}
+/* a table cell listing file names; once the deal's SharePoint files are read, each name that matches becomes a link that opens it */
+function fileLinksCell(ref, names, cls, emptyNode, savedLinks) {
+  const saved = parseFileLinks(savedLinks);
+  const draw = by => names.map(n => { const u = (saved.get(n.toLowerCase()) || {}).url || (by && (by.get(n.toLowerCase()) || {}).webUrl); return h("div", {}, u ? h("a", { href: u, target: "_blank", rel: "noopener" }, n) : n); });
+  const td = h("td", { class: cls }, names.length ? draw(null) : (emptyNode || ""));
+  // names without a saved link (older orders, or no "Files Links" column yet) are looked up in the deal's SharePoint folders
+  if (names.some(n => !saved.has(n.toLowerCase()))) dealFiles(ref).then(files => {
+    td.replaceChildren(...draw(new Map(files.map(f => [f.name.toLowerCase(), f]))));
+  }).catch(() => {});
+  return td;
 }
 async function dealFiles(ref) {
   const driveId = await doDriveId(), key = safeFileKey(ref), out = [];
@@ -2842,6 +2854,21 @@ async function uploadToDealFolder(ref, file) {
 }
 const splitNames = v => String(v || "").split(/;\s*/).map(x => x.trim()).filter(Boolean);
 const uniqNames = a => [...new Set(a)];
+/* "Files Links" column: one line per file, "<file name> | <SharePoint link>" */
+function parseFileLinks(text) {
+  const m = new Map();
+  String(text || "").split(/\r?\n/).forEach(line => {
+    const i = line.lastIndexOf(" | ");
+    if (i > 0) { const name = line.slice(0, i).trim(), url = line.slice(i + 3).trim(); if (name && /^https?:\/\//i.test(url)) m.set(name.toLowerCase(), { name, url }); }
+  });
+  return m;
+}
+/* add / refresh the links for these files (objects with name + webUrl) and return the text to save */
+function mergeFileLinks(existingText, files) {
+  const m = parseFileLinks(existingText);
+  (files || []).forEach(f => { if (f && f.name && f.webUrl) m.set(f.name.toLowerCase(), { name: f.name, url: f.webUrl }); });
+  return [...m.values()].map(x => `${x.name} | ${x.url}`).join("\n");
+}
 
 /* ---------- the tab ---------- */
 function buildDealOrders() {
@@ -2870,7 +2897,7 @@ function buildDealOrders() {
       const missPost = DO_POST_COLS.filter(d => !linksCtx.col[d]);
       if (missPost.length) notes.push(`Add these columns (Single line of text) to ${DO().listName} to use the Post buttons: ${missPost.join(", ")}.`);
     }
-    catch (e) { notes.push(`Deal order list: ${e.message} Create it on the Operations site with these Single-line-of-text columns: ${DO_REQUIRED.join(", ")} (optional: ${[DOCOL.party, DOCOL.files, DOCOL.note, DOCOL.notified].join(", ")}). The list title holds the Agreement ID. Orders cannot be created until it exists.`); }
+    catch (e) { notes.push(`Deal order list: ${e.message} Create it on the Operations site with these Single-line-of-text columns: ${DO_REQUIRED.join(", ")} (optional: ${[DOCOL.party, DOCOL.files, DOCOL.links, DOCOL.note, DOCOL.notified].join(", ")}; "${DOCOL.links}" is Multiple lines of text). The list title holds the Agreement ID. Orders cannot be created until it exists.`); }
     try { register = await spItems(await regList()); } catch (e) { register = []; notes.push("Register: " + e.message); }
     await Promise.all(["rec", "cc"].map(async s => {
       const src = PARTY_SOURCES[s];
@@ -2939,8 +2966,8 @@ function buildDealOrders() {
         return h("tr", {},
           h("td", {}, h("b", {}, no), " ", h("span", { class: "muted small" }, type)), h("td", {}, fv(l, DOCOL.ref)), h("td", { class: "wrap" }, fv(l, DOCOL.party)),
           h("td", {}, isNaN(d) ? "" : fmtDate(d)),
-          h("td", { class: "wrap small", title: inBc.join("\n") }, inBc.length ? `${inBc.length} file(s)` : h("span", { class: "muted" }, "none")),
-          h("td", { class: "wrap small" }, waiting.length ? h("span", { class: "tag warn", title: waiting.join("\n") }, `${waiting.length} file(s)`) : ""),
+          fileLinksCell(fv(l, DOCOL.ref), inBc, "wrap small", h("span", { class: "muted" }, "none"), fv(l, DOCOL.links)),
+          fileLinksCell(fv(l, DOCOL.ref), waiting, "wrap small", null, fv(l, DOCOL.links)),
           h("td", { class: "wrap small" }, fv(l, DOCOL.postedDate) ? h("span", { class: "tag ok" }, `Posted ${fv(l, DOCOL.postedDate).slice(0, 10)} by ${fv(l, DOCOL.postedBy)}`) : h("span", { class: "tag" }, "Draft")),
           h("td", { class: "wrap" }, financeCell(l)),
           h("td", {}, h("span", { class: "row-actions", style: "margin:0;flex-wrap:wrap" },
@@ -2995,7 +3022,7 @@ function buildDealOrders() {
       if (await canAttach(type)) r = await attachFilesToOrder(type, { id: order.id, number: no }, placed, setStatus);
       else note = " Purchase orders need Saxon Portal API v1.6 in BC to take attachments, so the files are waiting in SharePoint.";
       const { inBc, pending } = bcResult(l, placed.map(p => p.name), r);
-      await spWrite(linksCtx, l.id, { [DOCOL.files]: inBc.join("; ").slice(0, 250), [DOCOL.pending]: pending.join("; ").slice(0, 250), [DOCOL.lastUpload]: new Date().toISOString() }, null);
+      await spWrite(linksCtx, l.id, { [DOCOL.files]: inBc.join("; ").slice(0, 250), [DOCOL.pending]: pending.join("; ").slice(0, 250), [DOCOL.lastUpload]: new Date().toISOString(), [DOCOL.links]: mergeFileLinks(fv(l, DOCOL.links), placed) }, null);
       const problems = [...failed, ...r.failed];
       setStatus(`${no}: ${r.attached.length} of ${files.length} file(s) are on the BC draft.` + note + (problems.length ? " Problems: " + problems.slice(0, 3).join("; ") : ""), problems.length || note ? "warn" : "ok");
     } catch (e) { setStatus("Upload failed: " + e.message, "err"); }
@@ -3015,7 +3042,7 @@ function buildDealOrders() {
       if (!files.length) { setStatus(`No files found for deal ${ref} in SharePoint.`, "warn"); return; }
       const r = await attachFilesToOrder(type, { id: order.id, number: no }, files, setStatus);
       const inBc = uniqNames(r.attached), pending = files.map(f => f.name).filter(n => !inBc.includes(n));
-      await spWrite(linksCtx, l.id, { [DOCOL.files]: inBc.join("; ").slice(0, 250), [DOCOL.pending]: pending.join("; ").slice(0, 250) }, null);
+      await spWrite(linksCtx, l.id, { [DOCOL.files]: inBc.join("; ").slice(0, 250), [DOCOL.pending]: pending.join("; ").slice(0, 250), [DOCOL.links]: mergeFileLinks(fv(l, DOCOL.links), files) }, null);
       setStatus(`${no}: ${inBc.length} file(s) on the BC draft.` + (r.failed.length ? " Problems: " + r.failed.slice(0, 3).join("; ") : ""), r.failed.length ? "warn" : "ok");
     } catch (e) { setStatus("Could not sync files: " + e.message, "err"); }
     finally { busy = false; refresh(); }
@@ -3103,7 +3130,7 @@ function buildDealOrders() {
       if (!files.length) { filesBox.replaceChildren("No files found for this deal in SharePoint (agreement / T&C / redemption folders)."); return; }
       filesBox.replaceChildren(...files.map(f => {
         const cb = h("input", { type: "checkbox", checked: true }); fileBoxes.push({ cb, f });
-        return h("label", { class: "chk" }, cb, `${f.kind}: ${f.name} (${Math.max(1, Math.round(f.size / 1024))} KB)`);
+        return h("label", { class: "chk" }, cb, `${f.kind}: `, f.webUrl ? h("a", { href: f.webUrl, target: "_blank", rel: "noopener" }, f.name) : f.name, ` (${Math.max(1, Math.round(f.size / 1024))} KB)`);
       }), isPO && !poAttachOk ? h("div", { class: "muted small", style: "margin-top:.3rem" }, h("span", { class: "tag warn" }, "Saxon Portal API v1.6 not found"), " BC cannot take attachments on purchase orders without it. The file names will be written as comment lines on the PO instead.") : "");
     }).catch(e => filesBox.replaceChildren("Could not read the files from SharePoint: " + e.message));
 
@@ -3159,7 +3186,7 @@ function buildDealOrders() {
         let posted = null, postErr = "";
         if (doPost) { try { posted = await orderPosters[key](order, setStatus); } catch (e) { postErr = e.message; notes.push(`Posting failed: ${e.message}`); } }
         const postFields = doPost && !postErr ? { [DOCOL.postedBy]: account.username, [DOCOL.postedDate]: new Date().toISOString() } : {};
-        await spWrite(linksCtx, row.id, { [DOCOL.status]: DO_STATUS.created, [DOCOL.files]: attachedNames.join("; ").slice(0, 250), [DOCOL.note]: notes.join(" ").slice(0, 250), ...postFields }, null);
+        await spWrite(linksCtx, row.id, { [DOCOL.status]: DO_STATUS.created, [DOCOL.files]: attachedNames.join("; ").slice(0, 250), [DOCOL.links]: mergeFileLinks("", chosen), [DOCOL.note]: notes.join(" ").slice(0, 250), ...postFields }, null);
         setStatus(`Saved draft ${order.number} for deal ${g.ref} with ${made.done} line(s)` + (attachedNames.length ? ` and ${attachedNames.length} file(s).` : ".") +
           (doPost ? (postErr ? ` Posting failed (the draft is saved): ${postErr}` : posted && posted.nothing ? " Nothing left to post." : ` Posted – ${def.stepPast}. Press Notify Finance when ready.`) : "") +
           (notes.filter(n => !n.startsWith("Posting failed")).length ? " Check: " + notes.filter(n => !n.startsWith("Posting failed")).slice(0, 3).join(" ") : ""), notes.length ? "warn" : "ok");
