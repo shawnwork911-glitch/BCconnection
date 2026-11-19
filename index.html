@@ -85,6 +85,17 @@
   input.upper { text-transform:uppercase; }
   .fx-item { margin-top:.6rem; padding:.5rem .6rem; background:#f7f9fb; border:1px dashed var(--line); border-radius:6px; }
   input:disabled { background:#eef1f4; color:var(--muted); }
+  /* table that wraps its text so every column fits the screen (no sideways scrolling) */
+  table.fit { table-layout:auto; font-size:.8rem; }
+  table.fit th, table.fit td { white-space:normal; overflow-wrap:anywhere; padding:.4rem .4rem; vertical-align:top; }
+  table.fit td.wrap { min-width:0; max-width:none; }
+  table.fit .row-actions { flex-direction:column; align-items:stretch; gap:.3rem; }
+  table.fit .row-actions button { width:100%; white-space:nowrap; }
+  table.fit td:last-child { width:1%; }
+  .dealmsg { margin:0 0 1rem; padding:.6rem .8rem; background:#e9edf2; border-radius:6px; line-height:1.4; }
+  .dealmsg.err  { background:#fdecea; color:#8a1c12; }
+  .dealmsg.ok   { background:#e6f4ea; color:#14532d; }
+  .dealmsg.warn { background:var(--warn-bg); color:var(--warn); }
   #lockbar { margin:0 1rem .75rem; padding:.6rem .8rem; border-radius:6px; background:#fdecea; color:#8a1c12; border:1px solid #f3b8b2; display:flex; gap:.75rem; align-items:center; flex-wrap:wrap; }
   #lockbar b { white-space:nowrap; }
   #lockbar .grow { flex:1; min-width:200px; }
@@ -2879,6 +2890,14 @@ function buildDealOrders() {
   const picker = h("input", { type: "file", multiple: true, class: "hidden", accept: "." + DEAL_UPLOAD_EXT.join(",.") });
   picker.addEventListener("change", () => { const l = pickFor, fl = [...picker.files]; picker.value = ""; if (l && fl.length) uploadFor(l, fl); });
   let groups = [], links = [], linksCtx = null, register = [], loadNotes = [], openKey = null, busy = false;
+  /* messages from this tab (creating, posting, uploading, syncing) are shown right below the create form,
+     not in the status bar at the top of the page; this local setStatus shadows the global one inside this tab */
+  const dealMsg = h("div", { class: "dealmsg hidden", role: "status" });
+  function setStatus(msg, kind) {
+    dealMsg.textContent = msg || "";
+    dealMsg.className = "dealmsg" + (msg ? "" : " hidden") + (kind ? " " + kind : "");
+    if (msg) dealMsg.scrollIntoView({ block: "nearest" });
+  }
   filter.addEventListener("input", () => draw());
 
   const linkKey = (ref, srcLabel, entity, type) => [ref, srcLabel, entity.toUpperCase(), type.toUpperCase()].join("|");
@@ -2958,7 +2977,7 @@ function buildDealOrders() {
       .sort((a, b) => Number(b.id) - Number(a.id)).slice(0, 100);
     const colsOk = !!linksCtx && DO_NEW_COLS.every(d => linksCtx.col[d]);
     const postColsOk = !!linksCtx && DO_POST_COLS.every(d => linksCtx.col[d]);
-    createdBox.replaceChildren(!made.length ? h("p", { class: "muted" }, "No orders created from deals yet.") : h("table", {},
+    createdBox.replaceChildren(!made.length ? h("p", { class: "muted" }, "No orders created from deals yet.") : h("table", { class: "fit" },
       h("thead", {}, h("tr", {}, ["Order", "Deal ID", "Counterparty", "Created", "Files in BC", "Waiting for BC", "Posting", "Finance", ""].map(x => h("th", {}, x)))),
       h("tbody", {}, made.map(l => {
         const type = fv(l, DOCOL.type), no = fv(l, DOCOL.no), d = new Date(fv(l, DOCOL.date));
@@ -3225,6 +3244,7 @@ function buildDealOrders() {
         h("div", { class: "row-actions", style: "margin:0" }, filter, h("button", { type: "button", class: "ghost", onclick: refresh }, "Refresh"))),
       note, pendingBox),
     reviewBox,
+    dealMsg,
     h("div", { class: "card" }, h("h2", {}, "Created orders"), h("p", { class: "muted small", style: "margin:-.4rem 0 .5rem" }, "Draft orders created from deals. Upload more files for an order (up to 10 MB each: PDF, Word, Excel, CSV, PNG, JPG, ZIP), then press Notify Finance when it is ready for their next step."), createdBox, picker));
 }
 
