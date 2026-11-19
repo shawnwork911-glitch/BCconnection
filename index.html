@@ -92,6 +92,7 @@
   table.fit .row-actions { flex-direction:column; align-items:stretch; gap:.3rem; }
   table.fit .row-actions button { width:100%; white-space:nowrap; }
   table.fit td:last-child { width:1%; }
+  tr.closed td { background:#f7f9fb; color:var(--muted); }
   .dealmsg { margin:0 0 1rem; padding:.6rem .8rem; background:#e9edf2; border-radius:6px; line-height:1.4; }
   .dealmsg.err  { background:#fdecea; color:#8a1c12; }
   .dealmsg.ok   { background:#e6f4ea; color:#14532d; }
@@ -2982,14 +2983,14 @@ function buildDealOrders() {
       h("tbody", {}, made.map(l => {
         const type = fv(l, DOCOL.type), no = fv(l, DOCOL.no), d = new Date(fv(l, DOCOL.date));
         const inBc = splitNames(fv(l, DOCOL.files)), waiting = splitNames(fv(l, DOCOL.pending));
-        return h("tr", {},
+        return h("tr", { class: isClosed(l) ? "closed" : "" },
           h("td", {}, h("b", {}, no), " ", h("span", { class: "muted small" }, type)), h("td", {}, fv(l, DOCOL.ref)), h("td", { class: "wrap" }, fv(l, DOCOL.party)),
           h("td", {}, isNaN(d) ? "" : fmtDate(d)),
           fileLinksCell(fv(l, DOCOL.ref), inBc, "wrap small", h("span", { class: "muted" }, "none"), fv(l, DOCOL.links)),
           fileLinksCell(fv(l, DOCOL.ref), waiting, "wrap small", null, fv(l, DOCOL.links)),
           h("td", { class: "wrap small" }, fv(l, DOCOL.postedDate) ? h("span", { class: "tag ok" }, `Posted ${fv(l, DOCOL.postedDate).slice(0, 10)} by ${fv(l, DOCOL.postedBy)}`) : h("span", { class: "tag" }, "Draft")),
           h("td", { class: "wrap" }, financeCell(l)),
-          h("td", {}, h("span", { class: "row-actions", style: "margin:0;flex-wrap:wrap" },
+          h("td", {}, isClosed(l) ? h("span", { class: "tag ok", title: "Finance has handled this order. It can only be viewed here." }, "Closed – view only") : h("span", { class: "row-actions", style: "margin:0;flex-wrap:wrap" },
             fv(l, DOCOL.postedDate) ? "" : h("button", { type: "button", class: "small", disabled: busy || !postColsOk || postingLock.locked, title: postingLock.locked ? lockMessage() : postColsOk ? "" : "Add the Posted By / Posted Date columns first", onclick: () => postRow(l) }, `Post (${ORDERS[type.toLowerCase()].stepVerb})`),
             h("button", { type: "button", class: "small", disabled: busy || !colsOk, onclick: () => { pickFor = l; picker.click(); } }, "Upload files"),
             h("button", { type: "button", class: "small ghost", disabled: busy || !colsOk, onclick: () => syncFiles(l) }, waiting.length ? "Retry files" : "Sync files"),
@@ -2998,12 +2999,23 @@ function buildDealOrders() {
   }
 
   /* Finance column: not notified / notified (who, when, note) / picked up by Finance; a tag when files came after the notice */
+  /* Finance has handled the order (the AP Request system fills Finance Handled By / Date): the row is closed, view only */
+  const isClosed = l => !!(fv(l, DOCOL.handledBy) || fv(l, DOCOL.handledDate));
+  /* re-reads the row just before an action, so a row Finance closed after this page loaded is still blocked */
+  async function stillOpen(l) {
+    let row = l;
+    try { row = await spGet(linksCtx, l.id); } catch { /* cannot re-read: use what is on screen */ }
+    if (!isClosed(row)) return true;
+    setStatus(`${fv(row, DOCOL.no)} was handled by Finance (${fv(row, DOCOL.handledBy) || "Finance"}${fv(row, DOCOL.handledDate) ? ", " + fv(row, DOCOL.handledDate).slice(0, 10) : ""}) and is now closed – view only.`, "warn");
+    refresh();
+    return false;
+  }
   function financeCell(l) {
     const nd = fv(l, DOCOL.notified), by = fv(l, DOCOL.finBy), nt = fv(l, DOCOL.finNote), hb = fv(l, DOCOL.handledBy), hd = fv(l, DOCOL.handledDate), lu = fv(l, DOCOL.lastUpload);
-    if (!nd) return h("span", { class: "tag" }, "Not notified");
-    const out = [hb ? h("span", { class: "tag ok" }, `Picked up by ${hb} on ${hd.slice(0, 10)}`) : h("span", { class: "tag warn" }, `Notified ${nd.slice(0, 10)} by ${by || "?"}`)];
+    if (!nd && !isClosed(l)) return h("span", { class: "tag" }, "Not notified");
+    const out = [isClosed(l) ? h("span", { class: "tag ok" }, `Handled by ${hb || "Finance"}${hd ? " on " + hd.slice(0, 10) : ""}`) : h("span", { class: "tag warn" }, `Notified ${nd.slice(0, 10)} by ${by || "?"}`)];
     if (nt) out.push(h("div", { class: "small muted" }, nt));
-    if (lu && lu > nd) out.push(h("span", { class: "tag warn" }, "New files since notice"));
+    if (lu && nd && lu > nd && !isClosed(l)) out.push(h("span", { class: "tag warn" }, "New files since notice"));
     return h("div", {}, out);
   }
 
@@ -3026,6 +3038,7 @@ function buildDealOrders() {
   async function uploadFor(l, fileList) {
     const files = [...fileList], errs = files.map(checkDealFile).filter(Boolean);
     if (errs.length) { setStatus(errs.join(" "), "err"); return; }
+    if (!(await stillOpen(l))) return;
     const type = fv(l, DOCOL.type).toLowerCase(), no = fv(l, DOCOL.no), ref = fv(l, DOCOL.ref);
     busy = true; draw();
     try {
@@ -3051,6 +3064,7 @@ function buildDealOrders() {
   /* Retry / sync: put every deal file that is in SharePoint but not on the BC order yet (e.g. a refused file, or redemption docs that arrived later) */
   async function syncFiles(l) {
     const type = fv(l, DOCOL.type).toLowerCase(), no = fv(l, DOCOL.no), ref = fv(l, DOCOL.ref);
+    if (!(await stillOpen(l))) return;
     busy = true; draw();
     try {
       setStatus(`${no}: checking the order in BC...`);
@@ -3070,6 +3084,7 @@ function buildDealOrders() {
   /* Post (receive / ship) a draft that is already in BC. Invoicing stays Finance's step. */
   async function postRow(l) {
     const type = fv(l, DOCOL.type).toLowerCase(), no = fv(l, DOCOL.no), def = ORDERS[type];
+    if (!(await stillOpen(l))) return;
     if (await postingBlocked()) return;   // posting lock
     if (!confirm(`${def.stepLabel} ${no} in Business Central (post)?\n\nThis ${def.stepVerb}s the stock and cannot be undone from this portal. Invoicing stays a separate step for Finance.`)) return;
     busy = true; draw();
@@ -3085,6 +3100,7 @@ function buildDealOrders() {
 
   /* Notify Finance: a recorded notice (no email). A new notice clears an earlier "handled", so it returns to Finance's waiting list. */
   async function notifyFinance(l) {
+    if (!(await stillOpen(l))) return;
     const no = fv(l, DOCOL.no);
     const isSO = fv(l, DOCOL.type) === "SO";
     const suggestion = fv(l, DOCOL.postedDate) ? (isSO ? "SO shipped in BC, please raise the invoice" : "PO received in BC, please check the vendor invoice and arrange payment") : "";
